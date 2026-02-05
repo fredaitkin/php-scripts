@@ -1,0 +1,132 @@
+# Google Fit API Integration - Setup Guide
+
+## Overview
+This document covers the complete process of integrating Google Fit API with a PHP application to retrieve fitness data from a Google Pixel phone.
+
+## Prerequisites
+- Google Account
+- Google Cloud Project with Google Fit API enabled
+- PHP 7.4+ with cURL support
+- OAuth 2.0 credentials (Client ID and Secret)
+
+## Step 1: Register Your App in Google Cloud Console
+
+### Create a Google Cloud Project
+1. Visit [Google Cloud Console](https://console.cloud.google.com/)
+2. Click the project dropdown at the top
+3. Click "NEW PROJECT"
+4. Enter a project name (e.g., "Fubar Google Fit")
+5. Click "CREATE"
+6. Wait for initialization and select the new project
+
+### Enable the Google Fit API
+1. In the search bar, search for "Google Fit API"
+2. Click on it
+3. Click "ENABLE"
+
+### Create OAuth 2.0 Credentials
+1. Go to "APIs & Services" > "Credentials" (left sidebar)
+2. Click "CREATE CREDENTIALS" > "OAuth client ID"
+3. If prompted, configure the OAuth consent screen first:
+   - Click "CONFIGURE CONSENT SCREEN"
+   - Select "External" user type
+   - Fill in app name, user support email, etc.
+   - Add scopes: search for "fitness" and add Google Fit scopes
+   - Add test users (your Gmail account)
+   - Save and continue
+4. Back to credentials, click "CREATE CREDENTIALS" > "OAuth client ID" again
+5. Choose application type: "Web application"
+6. Add authorized redirect URI: `http://localhost:8000/callback`
+7. Click "CREATE"
+8. Save your Client ID and Client Secret
+
+### Add Yourself as a Test User
+Since Google Fit is a sensitive API:
+1. Go to **APIs & Services** > **OAuth consent screen**
+2. Scroll down to **Test users**
+3. Click **+ ADD USERS**
+4. Enter your Gmail address
+5. Click **ADD**
+
+## Step 2: The PHP Scripts
+#### 1. `google_fit_connector.php`
+Main script for OAuth authentication and data fetching. Supports three commands:
+- `auth` - Generate authorization URL
+- `token CODE` - Exchange authorization code for access token
+- `data` - Fetch fitness data from Google Fit API
+
+#### 2. `google_fit_callback.php`
+Simple web server callback handler that captures the authorization code from Google's redirect.
+
+### Configuration
+Copy google_fit_config.example.php to google_fit_config.php and set Client ID and Client Secret
+---
+
+## Step 3: OAuth Authorization Flow
+
+### Step 3A: Start the Callback Server
+The callback server listens on `localhost:8000` to capture the authorization code:
+
+```bash
+php -S localhost:8000 tools/google_fit_callback.php
+```
+
+Leave this running in a terminal window.
+
+### Step 3B: Generate Authorization URL
+In a separate terminal:
+
+```bash
+php tools/google_fit_connector.php auth
+```
+
+This outputs an authorization URL. Copy it and visit it in your browser.
+
+### Step 3C: Authorize the Application
+1. Visit the URL in Firefox or Chrome
+2. Log in with your Google account (the one you added as a test user)
+3. Review the permissions requested (fitness data access)
+4. Click "Allow"
+5. You'll be redirected to `localhost:8000` and shown your authorization code
+
+### Step 3D: Exchange Code for Access Token
+Copy the authorization code and run:
+
+```bash
+php tools/google_fit_connector.php token YOUR_AUTH_CODE
+```
+
+Example:
+```bash
+php tools/google_fit_connector.php token 4/0AY0e-g6xZ...
+```
+
+The script will:
+- Exchange the code for an access token
+- Save the token to `google_fit_token.json`
+- Display: "Token saved! You can now fetch data."
+
+## Step 4: Fetch Fitness Data
+
+Once you have a valid token, retrieve your fitness data:
+
+```bash
+php tools/google_fit_connector.php data
+```
+
+### Output Example
+```
+=== Google Fit Data ===
+
+Date: 2026-02-05
+  com.google.step_count.delta: 8432
+  com.google.distance.delta: 6.23
+  com.google.calories.expended: 425.5
+  com.google.heart_rate.bpm: 72
+```
+
+The script fetches:
+- **Steps**: Daily step count
+- **Distance**: Distance traveled (km)
+- **Calories**: Calories expended
+- **Heart Rate**: Average BPM
