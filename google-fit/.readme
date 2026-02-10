@@ -50,10 +50,11 @@ Since Google Fit is a sensitive API:
 
 ## Step 2: The PHP Scripts
 #### 1. `google_fit_connector.php`
-Main script for OAuth authentication and data fetching. Supports three commands:
+Main script for OAuth authentication and data fetching. Supports four commands:
 - `auth` - Generate authorization URL
 - `token CODE` - Exchange authorization code for access token
-- `data` - Fetch fitness data from Google Fit API
+- `data [DATE]` - Fetch fitness data (optional DATE format: YYYY-MM-DD, default: today)
+- `auto [DATE]` - Refresh token (if needed) and fetch fitness data (optional DATE format: YYYY-MM-DD, default: today)
 
 #### 2. `google_fit_callback.php`
 Simple web server callback handler that captures the authorization code from Google's redirect.
@@ -111,7 +112,17 @@ The script will:
 Once you have a valid token, retrieve your fitness data:
 
 ```bash
+# Fetch today's data
 php tools/google_fit_connector.php data
+
+# Fetch data for a specific date
+php tools/google_fit_connector.php data 2026-02-08
+
+# Auto-refresh token (if needed) and fetch today's data
+php tools/google_fit_connector.php auto
+
+# Auto-refresh token (if needed) and fetch data for a specific date
+php tools/google_fit_connector.php auto 2026-02-08
 ```
 
 ### Output Example
@@ -120,13 +131,13 @@ php tools/google_fit_connector.php data
 
 Date: 2026-02-05
   com.google.step_count.delta: 8432
-  com.google.distance.delta: 6.23
+  com.google.distance.delta:com.google.android.gms:aggregated: 6076.56 meters (3.78 miles)
   com.google.calories.expended: 425.5
   com.google.heart_rate.bpm: 72
 ```
 
 The script fetches:
 - **Steps**: Daily step count
-- **Distance**: Distance traveled (km)
+- **Distance**: Distance traveled (meters, converted to miles for display)
 - **Calories**: Calories expended
 - **Heart Rate**: Average BPM
