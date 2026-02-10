@@ -271,9 +271,17 @@ function fetchFitnessData($config, $date = null) {
     $tokenData = json_decode(file_get_contents($config['token_file']), true);
     $accessToken = $tokenData['access_token'];
 
-    // Get date range for the specified date
-    $startOfDay = new DateTime($date . ' 00:00:00', new DateTimeZone('UTC'));
-    $endOfDay = new DateTime($date . ' 23:59:59', new DateTimeZone('UTC'));
+    // Get date range for the specified date in local timezone (or configured timezone)
+    $timezoneName = $config['timezone'] ?? date_default_timezone_get();
+    try {
+        $timezone = new DateTimeZone($timezoneName);
+    } catch (Exception $e) {
+        echo "Warning: Invalid timezone '$timezoneName'. Falling back to UTC.\n";
+        $timezone = new DateTimeZone('UTC');
+    }
+
+    $startOfDay = new DateTime($date . ' 00:00:00', $timezone);
+    $endOfDay = new DateTime($date . ' 23:59:59', $timezone);
     
     $startMs = (int)($startOfDay->getTimestamp() * 1000);
     $endMs = (int)($endOfDay->getTimestamp() * 1000);

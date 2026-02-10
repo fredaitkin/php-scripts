@@ -11,4 +11,6 @@ return [
     'client_secret' => 'YOUR_CLIENT_SECRET_HERE',
     'redirect_uri' => 'http://localhost:8000/callback',
     'token_file' => __DIR__ . '/google_fit_token.json',
+    // Optional: override timezone used for daily boundaries (PHP timezone identifier)
+    'timezone' => 'America/New_York',
 ];
