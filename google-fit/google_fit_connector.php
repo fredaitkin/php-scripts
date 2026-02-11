@@ -34,6 +34,7 @@ if (!isset($argv[1])) {
     echo "  php google_fit_connector.php auth              - Get authorization code\n";
     echo "  php google_fit_connector.php data [DATE]       - Fetch fitness data (DATE format: YYYY-MM-DD, default: today)\n";
     echo "  php google_fit_connector.php auto [DATE]       - Refresh token and fetch data (DATE format: YYYY-MM-DD, default: today)\n";
+    echo "  php google_fit_connector.php csv START_DATE [END_DATE] [OUTPUT_PATH] - Export daily data to CSV\n";
     exit(1);
 }
 
@@ -46,6 +47,12 @@ if ($command === 'auth') {
     fetchFitnessData($config, $date);
 } elseif ($command === 'auto') {
     autoRefreshAndFetchData($config, $date);
+} elseif ($command === 'csv' && isset($argv[2])) {
+    $startDate = $argv[2];
+    $endDate = isset($argv[3]) ? $argv[3] : null;
+    $outputPath = isset($argv[4]) ? $argv[4] : null;
+    ensureValidAccessToken($config);
+    fetchDailyDataRangeToCsv($config, $startDate, $endDate, $outputPath);
 } elseif ($command === 'token' && isset($argv[2])) {
     exchangeTokenFromCode($config, $argv[2]);
 } else {
@@ -54,6 +61,7 @@ if ($command === 'auth') {
     echo "  php google_fit_connector.php token CODE        - Exchange code for token\n";
     echo "  php google_fit_connector.php data [DATE]       - Fetch fitness data (DATE format: YYYY-MM-DD, default: today)\n";
     echo "  php google_fit_connector.php auto [DATE]       - Refresh token and fetch data (DATE format: YYYY-MM-DD, default: today)\n";
+    echo "  php google_fit_connector.php csv START_DATE [END_DATE] [OUTPUT_PATH] - Export daily data to CSV\n";
     exit(1);
 }
 
@@ -249,106 +257,42 @@ function refreshAccessToken($config, $tokenData) {
 }
 
 /**
- * Step 3: Fetch fitness data from Google Fit API
+ * Ensure a valid access token is available, refreshing if needed
  */
-function fetchFitnessData($config, $date = null) {
+function ensureValidAccessToken($config) {
     if (!file_exists($config['token_file'])) {
-        echo "No token found. Run 'php google_fit_connector.php auth' first.\n";
-        exit(1);
-    }
-
-    // Use provided date or default to today
-    if ($date === null) {
-        $date = date('Y-m-d');
-    }
-    
-    // Validate date format
-    if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $date)) {
-        echo "Invalid date format. Use YYYY-MM-DD\n";
+        echo "Error: No token found at " . $config['token_file'] . "\n";
+        echo "You must complete the initial authorization first:\n";
+        echo "  1. php google_fit_connector.php auth\n";
+        echo "  2. Visit the provided URL and authorize\n";
+        echo "  3. Copy the authorization code\n";
+        echo "  4. php google_fit_connector.php token YOUR_AUTH_CODE\n";
         exit(1);
     }
 
     $tokenData = json_decode(file_get_contents($config['token_file']), true);
-    $accessToken = $tokenData['access_token'];
 
-    // Get date range for the specified date in local timezone (or configured timezone)
-    $timezoneName = $config['timezone'] ?? date_default_timezone_get();
-    try {
-        $timezone = new DateTimeZone($timezoneName);
-    } catch (Exception $e) {
-        echo "Warning: Invalid timezone '$timezoneName'. Falling back to UTC.\n";
-        $timezone = new DateTimeZone('UTC');
-    }
-
-    $startOfDay = new DateTime($date . ' 00:00:00', $timezone);
-    $endOfDay = new DateTime($date . ' 23:59:59', $timezone);
-    
-    $startMs = (int)($startOfDay->getTimestamp() * 1000);
-    $endMs = (int)($endOfDay->getTimestamp() * 1000);
-
-    // Request body for aggregated fitness data
-    $requestBody = [
-        'aggregateBy' => [
-            [
-                'dataTypeName' => 'com.google.step_count.delta',
-            ],
-            [
-                // Distance data requires fitness.location.read permission
-                'dataTypeName' => 'com.google.distance.delta',
-            ],
-            [
-                // Uncomment to include calories data
-                // 'dataTypeName' => 'com.google.calories.expended',
-            ],
-            [
-                // Uncomment to include heart rate data
-                // 'dataTypeName' => 'com.google.heart_rate.bpm',
-            ],
-        ],
-        'bucketByTime' => [
-            'durationMillis' => 86400000, // 1 day in milliseconds
-        ],
-        'startTimeMillis' => $startMs,
-        'endTimeMillis' => $endMs,
-    ];
-
-    // Make API request
-    $ch = curl_init('https://www.googleapis.com/fitness/v1/users/me/dataset:aggregate');
-    
-    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-    curl_setopt($ch, CURLOPT_POST, true);
-    curl_setopt($ch, CURLOPT_HTTPHEADER, [
-        'Content-Type: application/json',
-        'Authorization: Bearer ' . $accessToken,
-    ]);
-    curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($requestBody));
-
-    // Handle SSL certificate verification
-    $caBundle = __DIR__ . '/cacert.pem';
-    if (file_exists($caBundle)) {
-        curl_setopt($ch, CURLOPT_CAINFO, $caBundle);
-    } else {
-        curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
-        curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, 0);
-    }
-
-    $response = curl_exec($ch);
-    $curlError = curl_error($ch);
-    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-    curl_close($ch);
-
-    if ($curlError) {
-        echo "cURL Error: $curlError\n";
+    if (!isset($tokenData['refresh_token'])) {
+        echo "Error: Refresh token not found in token file.\n";
+        echo "Please re-authorize: php google_fit_connector.php auth\n";
         exit(1);
     }
 
-    if ($httpCode !== 200) {
-        echo "Error fetching data (HTTP $httpCode):\n";
-        echo $response . "\n";
-        exit(1);
-    }
+    $tokenExpiresAt = $tokenData['expires_at'] ?? 0;
+    $now = time();
 
-    $data = json_decode($response, true);
+    if ($now > $tokenExpiresAt - 300) {
+        echo "Token expired or expiring soon. Refreshing...\n";
+        refreshAccessToken($config, $tokenData);
+        echo "Token refreshed successfully.\n\n";
+    }
+}
+
+/**
+ * Step 3: Fetch fitness data from Google Fit API
+ */
+function fetchFitnessData($config, $date = null) {
+    $data = fetchAggregatedFitnessData($config, $date);
     
     echo "=== Google Fit Data ===\n\n";
     
@@ -391,4 +335,220 @@ function fetchFitnessData($config, $date = null) {
     } else {
         echo "No data found.\n";
     }
+}
+
+/**
+ * Fetch aggregated fitness data for a single day
+ */
+function fetchAggregatedFitnessData($config, $date = null) {
+    if (!file_exists($config['token_file'])) {
+        echo "No token found. Run 'php google_fit_connector.php auth' first.\n";
+        exit(1);
+    }
+
+    if ($date === null) {
+        $date = date('Y-m-d');
+    }
+
+    if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $date)) {
+        echo "Invalid date format. Use YYYY-MM-DD\n";
+        exit(1);
+    }
+
+    $tokenData = json_decode(file_get_contents($config['token_file']), true);
+    $accessToken = $tokenData['access_token'];
+
+    $timezoneName = $config['timezone'] ?? date_default_timezone_get();
+    try {
+        $timezone = new DateTimeZone($timezoneName);
+    } catch (Exception $e) {
+        echo "Warning: Invalid timezone '$timezoneName'. Falling back to UTC.\n";
+        $timezone = new DateTimeZone('UTC');
+    }
+
+    $startOfDay = new DateTime($date . ' 00:00:00', $timezone);
+    $endOfDay = new DateTime($date . ' 23:59:59', $timezone);
+    $startMs = (int)($startOfDay->getTimestamp() * 1000);
+    $endMs = (int)($endOfDay->getTimestamp() * 1000);
+
+    $requestBody = [
+        'aggregateBy' => [
+            [
+                'dataTypeName' => 'com.google.step_count.delta',
+            ],
+            [
+                'dataTypeName' => 'com.google.distance.delta',
+            ],
+            [
+                // Uncomment to include calories data
+                // 'dataTypeName' => 'com.google.calories.expended',
+            ],
+            [
+                // Uncomment to include heart rate data
+                // 'dataTypeName' => 'com.google.heart_rate.bpm',
+            ],
+        ],
+        'bucketByTime' => [
+            'durationMillis' => 86400000,
+        ],
+        'startTimeMillis' => $startMs,
+        'endTimeMillis' => $endMs,
+    ];
+
+    $ch = curl_init('https://www.googleapis.com/fitness/v1/users/me/dataset:aggregate');
+    
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    curl_setopt($ch, CURLOPT_POST, true);
+    curl_setopt($ch, CURLOPT_HTTPHEADER, [
+        'Content-Type: application/json',
+        'Authorization: Bearer ' . $accessToken,
+    ]);
+    curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($requestBody));
+
+    $caBundle = __DIR__ . '/cacert.pem';
+    if (file_exists($caBundle)) {
+        curl_setopt($ch, CURLOPT_CAINFO, $caBundle);
+    } else {
+        curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
+        curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, 0);
+    }
+
+    $response = curl_exec($ch);
+    $curlError = curl_error($ch);
+    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    curl_close($ch);
+
+    if ($curlError) {
+        echo "cURL Error: $curlError\n";
+        exit(1);
+    }
+
+    if ($httpCode !== 200) {
+        echo "Error fetching data (HTTP $httpCode):\n";
+        echo $response . "\n";
+        exit(1);
+    }
+
+    return json_decode($response, true);
+}
+
+/**
+ * Export daily step and distance totals from a start date to CSV
+ */
+function fetchDailyDataRangeToCsv($config, $startDate, $endDate = null, $outputPath = null) {
+    if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $startDate)) {
+        echo "Invalid start date format. Use YYYY-MM-DD\n";
+        exit(1);
+    }
+
+    if ($endDate === null) {
+        $endDate = date('Y-m-d');
+    }
+
+    if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $endDate)) {
+        echo "Invalid end date format. Use YYYY-MM-DD\n";
+        exit(1);
+    }
+
+    $start = new DateTime($startDate . ' 00:00:00');
+    $end = new DateTime($endDate . ' 00:00:00');
+
+    if ($end < $start) {
+        echo "End date cannot be earlier than start date.\n";
+        exit(1);
+    }
+
+    if ($outputPath === null) {
+        $outputPath = __DIR__ . '/google_fit_daily_' . $startDate . '_to_' . $endDate . '.csv';
+    }
+
+    $csvHandle = fopen($outputPath, 'w');
+    if ($csvHandle === false) {
+        echo "Unable to write CSV file to: $outputPath\n";
+        exit(1);
+    }
+
+    fputcsv($csvHandle, ['date', 'steps', 'miles'], ',', '"', '\\');
+
+    $cursor = clone $start;
+    $totalSteps = 0;
+    $totalDistanceMiles = 0.0;
+    $dayCount = 0;
+    while ($cursor <= $end) {
+        $currentDate = $cursor->format('Y-m-d');
+        $data = fetchAggregatedFitnessData($config, $currentDate);
+        $totals = extractDailyTotals($data);
+
+        fputcsv($csvHandle, [
+            $currentDate,
+            $totals['steps'],
+            round($totals['distance_miles'], 2),
+        ], ',', '"', '\\');
+
+        $totalSteps += (int)$totals['steps'];
+        $totalDistanceMiles += (float)$totals['distance_miles'];
+        $dayCount++;
+
+        $cursor->modify('+1 day');
+    }
+
+    $avgSteps = $dayCount > 0 ? $totalSteps / $dayCount : 0;
+    $avgMiles = $dayCount > 0 ? $totalDistanceMiles / $dayCount : 0;
+    fputcsv($csvHandle, [
+        'TOTALS',
+        $totalSteps,
+        round($totalDistanceMiles, 2),
+    ], ',', '"', '\\');
+    fputcsv($csvHandle, [
+        'AVERAGE',
+        round($avgSteps, 2),
+        round($avgMiles, 2),
+    ], ',', '"', '\\');
+
+    fclose($csvHandle);
+    echo "CSV export complete: $outputPath\n";
+}
+
+/**
+ * Extract daily step and distance totals from an aggregate response
+ */
+function extractDailyTotals($data) {
+    $steps = 0;
+    $distanceMeters = 0.0;
+
+    if (isset($data['bucket']) && !empty($data['bucket'])) {
+        foreach ($data['bucket'] as $bucket) {
+            foreach ($bucket['dataset'] as $dataset) {
+                $dataType = $dataset['dataSourceId'] ?? '';
+
+                if (!empty($dataset['point'])) {
+                    foreach ($dataset['point'] as $point) {
+                        foreach ($point['value'] as $value) {
+                            $valueNum = null;
+                            if (isset($value['intVal'])) {
+                                $valueNum = (int)$value['intVal'];
+                            } elseif (isset($value['fpVal'])) {
+                                $valueNum = (float)$value['fpVal'];
+                            }
+
+                            if ($valueNum !== null) {
+                                if (strpos($dataType, 'step_count.delta') !== false) {
+                                    $steps += (int)$valueNum;
+                                } elseif (strpos($dataType, 'distance.delta') !== false) {
+                                    $distanceMeters += (float)$valueNum;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    $distanceMiles = $distanceMeters * 0.000621371;
+
+    return [
+        'steps' => $steps,
+        'distance_miles' => $distanceMiles,
+    ];
 }
