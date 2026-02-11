@@ -395,41 +395,58 @@ function fetchAggregatedFitnessData($config, $date = null) {
         'endTimeMillis' => $endMs,
     ];
 
-    $ch = curl_init('https://www.googleapis.com/fitness/v1/users/me/dataset:aggregate');
-    
-    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-    curl_setopt($ch, CURLOPT_POST, true);
-    curl_setopt($ch, CURLOPT_HTTPHEADER, [
-        'Content-Type: application/json',
-        'Authorization: Bearer ' . $accessToken,
-    ]);
-    curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($requestBody));
+    $maxAttempts = 3;
+    $lastCurlError = null;
+    $lastHttpCode = null;
+    $lastResponse = null;
 
-    $caBundle = __DIR__ . '/cacert.pem';
-    if (file_exists($caBundle)) {
-        curl_setopt($ch, CURLOPT_CAINFO, $caBundle);
-    } else {
-        curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
-        curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, 0);
+    for ($attempt = 1; $attempt <= $maxAttempts; $attempt++) {
+        $ch = curl_init('https://www.googleapis.com/fitness/v1/users/me/dataset:aggregate');
+        
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($ch, CURLOPT_POST, true);
+        curl_setopt($ch, CURLOPT_HTTPHEADER, [
+            'Content-Type: application/json',
+            'Authorization: Bearer ' . $accessToken,
+        ]);
+        curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($requestBody));
+
+        $caBundle = __DIR__ . '/cacert.pem';
+        if (file_exists($caBundle)) {
+            curl_setopt($ch, CURLOPT_CAINFO, $caBundle);
+        } else {
+            curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
+            curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, 0);
+        }
+
+        $response = curl_exec($ch);
+        $curlError = curl_error($ch);
+        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        curl_close($ch);
+
+        if (!$curlError && $httpCode === 200) {
+            return json_decode($response, true);
+        }
+
+        $lastCurlError = $curlError ?: null;
+        $lastHttpCode = $httpCode;
+        $lastResponse = $response;
+
+        if ($attempt < $maxAttempts) {
+            $sleepSeconds = $attempt; // 1s, 2s
+            echo "Request failed (attempt $attempt/$maxAttempts). Retrying in $sleepSeconds seconds...\n";
+            sleep($sleepSeconds);
+        }
     }
 
-    $response = curl_exec($ch);
-    $curlError = curl_error($ch);
-    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-    curl_close($ch);
-
-    if ($curlError) {
-        echo "cURL Error: $curlError\n";
+    if ($lastCurlError) {
+        echo "cURL Error: $lastCurlError\n";
         exit(1);
     }
 
-    if ($httpCode !== 200) {
-        echo "Error fetching data (HTTP $httpCode):\n";
-        echo $response . "\n";
-        exit(1);
-    }
-
-    return json_decode($response, true);
+    echo "Error fetching data (HTTP $lastHttpCode):\n";
+    echo $lastResponse . "\n";
+    exit(1);
 }
 
 /**
