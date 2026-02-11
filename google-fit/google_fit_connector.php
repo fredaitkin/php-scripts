@@ -491,6 +491,8 @@ function fetchDailyDataRangeToCsv($config, $startDate, $endDate = null, $outputP
     $totalSteps = 0;
     $totalDistanceMiles = 0.0;
     $dayCount = 0;
+    $monthlyTotals = [];
+    $yearlyTotals = [];
     while ($cursor <= $end) {
         $currentDate = $cursor->format('Y-m-d');
         $data = fetchAggregatedFitnessData($config, $currentDate);
@@ -506,11 +508,66 @@ function fetchDailyDataRangeToCsv($config, $startDate, $endDate = null, $outputP
         $totalDistanceMiles += (float)$totals['distance_miles'];
         $dayCount++;
 
+        $monthKey = $cursor->format('M Y');
+        if (!isset($monthlyTotals[$monthKey])) {
+            $monthlyTotals[$monthKey] = [
+                'steps' => 0,
+                'miles' => 0.0,
+                'days' => 0,
+            ];
+        }
+        $monthlyTotals[$monthKey]['steps'] += (int)$totals['steps'];
+        $monthlyTotals[$monthKey]['miles'] += (float)$totals['distance_miles'];
+        $monthlyTotals[$monthKey]['days']++;
+
+        $yearKey = $cursor->format('Y');
+        if (!isset($yearlyTotals[$yearKey])) {
+            $yearlyTotals[$yearKey] = [
+                'steps' => 0,
+                'miles' => 0.0,
+                'days' => 0,
+            ];
+        }
+        $yearlyTotals[$yearKey]['steps'] += (int)$totals['steps'];
+        $yearlyTotals[$yearKey]['miles'] += (float)$totals['distance_miles'];
+        $yearlyTotals[$yearKey]['days']++;
+
         $cursor->modify('+1 day');
     }
 
     $avgSteps = $dayCount > 0 ? $totalSteps / $dayCount : 0;
     $avgMiles = $dayCount > 0 ? $totalDistanceMiles / $dayCount : 0;
+
+    foreach ($monthlyTotals as $month => $monthTotals) {
+        $monthAvgSteps = $monthTotals['days'] > 0 ? $monthTotals['steps'] / $monthTotals['days'] : 0;
+        $monthAvgMiles = $monthTotals['days'] > 0 ? $monthTotals['miles'] / $monthTotals['days'] : 0;
+        fputcsv($csvHandle, [
+            'MONTH TOTAL ' . $month,
+            $monthTotals['steps'],
+            round($monthTotals['miles'], 2),
+        ], ',', '"', '\\');
+        fputcsv($csvHandle, [
+            'MONTH AVERAGE ' . $month,
+            round($monthAvgSteps, 2),
+            round($monthAvgMiles, 2),
+        ], ',', '"', '\\');
+    }
+
+    foreach ($yearlyTotals as $year => $yearTotals) {
+        $yearAvgSteps = $yearTotals['days'] > 0 ? $yearTotals['steps'] / $yearTotals['days'] : 0;
+        $yearAvgMiles = $yearTotals['days'] > 0 ? $yearTotals['miles'] / $yearTotals['days'] : 0;
+        fputcsv($csvHandle, [
+            'YEAR TOTAL ' . $year,
+            $yearTotals['steps'],
+            round($yearTotals['miles'], 2),
+        ], ',', '"', '\\');
+        fputcsv($csvHandle, [
+            'YEAR AVERAGE ' . $year,
+            round($yearAvgSteps, 2),
+            round($yearAvgMiles, 2),
+        ], ',', '"', '\\');
+    }
+
     fputcsv($csvHandle, [
         'TOTALS',
         $totalSteps,
