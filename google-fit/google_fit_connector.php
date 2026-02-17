@@ -24,6 +24,7 @@ if (!file_exists($configFile)) {
 }
 
 $config = require $configFile;
+$config = applyDistanceProfile($config);
 
 // ============================================================================
 // MAIN SCRIPT
@@ -34,11 +35,12 @@ if (!isset($argv[1])) {
     echo "  php google_fit_connector.php auth              - Get authorization code\n";
     echo "  php google_fit_connector.php data [DATE]       - Fetch fitness data (DATE format: YYYY-MM-DD, default: today)\n";
     echo "  php google_fit_connector.php auto [DATE]       - Refresh token and fetch data (DATE format: YYYY-MM-DD, default: today)\n";
-    echo "  php google_fit_connector.php csv START_DATE [END_DATE] [OUTPUT_PATH] - Export daily data to CSV\n";
+    echo "  php google_fit_connector.php csv START_DATE [END_DATE] [OUTPUT_PATH] [--debug] - Export daily data to CSV\n";
     exit(1);
 }
 
 $command = $argv[1];
+$debugMode = in_array('--debug', $argv, true);
 $defaultTimezone = resolveConfiguredTimezone($config);
 $date = isset($argv[2]) ? $argv[2] : (new DateTime('now', $defaultTimezone))->format('Y-m-d'); // Get date parameter or use today
 
@@ -49,11 +51,22 @@ if ($command === 'auth') {
 } elseif ($command === 'auto') {
     autoRefreshAndFetchData($config, $date);
 } elseif ($command === 'csv' && isset($argv[2])) {
-    $startDate = $argv[2];
-    $endDate = isset($argv[3]) ? $argv[3] : null;
-    $outputPath = isset($argv[4]) ? $argv[4] : null;
+    $csvArgs = array_values(array_filter(array_slice($argv, 2), function ($arg) {
+        return strpos((string)$arg, '--') !== 0;
+    }));
+
+    $startDate = $csvArgs[0] ?? null;
+    $endDate = $csvArgs[1] ?? null;
+    $outputPath = $csvArgs[2] ?? null;
+
+    if ($startDate === null) {
+        echo "Usage:\n";
+        echo "  php google_fit_connector.php csv START_DATE [END_DATE] [OUTPUT_PATH] [--debug] - Export daily data to CSV\n";
+        exit(1);
+    }
+
     ensureValidAccessToken($config);
-    fetchDailyDataRangeToCsv($config, $startDate, $endDate, $outputPath);
+    fetchDailyDataRangeToCsv($config, $startDate, $endDate, $outputPath, $debugMode);
 } elseif ($command === 'token' && isset($argv[2])) {
     exchangeTokenFromCode($config, $argv[2]);
 } else {
@@ -62,7 +75,7 @@ if ($command === 'auth') {
     echo "  php google_fit_connector.php token CODE        - Exchange code for token\n";
     echo "  php google_fit_connector.php data [DATE]       - Fetch fitness data (DATE format: YYYY-MM-DD, default: today)\n";
     echo "  php google_fit_connector.php auto [DATE]       - Refresh token and fetch data (DATE format: YYYY-MM-DD, default: today)\n";
-    echo "  php google_fit_connector.php csv START_DATE [END_DATE] [OUTPUT_PATH] - Export daily data to CSV\n";
+    echo "  php google_fit_connector.php csv START_DATE [END_DATE] [OUTPUT_PATH] [--debug] - Export daily data to CSV\n";
     exit(1);
 }
 
@@ -290,6 +303,32 @@ function ensureValidAccessToken($config) {
 }
 
 /**
+ * Apply preset distance profile overrides
+ */
+function applyDistanceProfile($config) {
+    $profile = strtolower((string)($config['distance_profile'] ?? 'custom'));
+
+    if ($profile === 'lifefitness') {
+        $config['distance_mode'] = 'api';
+        $config['distance_source_include_contains'] = 'lifefitness';
+        unset($config['distance_source_exclude_contains']);
+        return $config;
+    }
+
+    if ($profile === 'google_fit') {
+        $config['distance_mode'] = 'steps_estimate';
+        if (!isset($config['step_length_meters'])) {
+            $config['step_length_meters'] = 0.4315;
+        }
+        unset($config['distance_source_include_contains']);
+        unset($config['distance_source_exclude_contains']);
+        return $config;
+    }
+
+    return $config;
+}
+
+/**
  * Resolve configured timezone with safe UTC fallback
  */
 function resolveConfiguredTimezone($config) {
@@ -382,17 +421,20 @@ function fetchAggregatedFitnessData($config, $date = null) {
     $timezone = resolveConfiguredTimezone($config);
 
     $startOfDay = new DateTime($date . ' 00:00:00', $timezone);
-    $endOfDay = new DateTime($date . ' 23:59:59', $timezone);
+    $endOfDay = (clone $startOfDay)->modify('+1 day');
     $startMs = (int)($startOfDay->getTimestamp() * 1000);
     $endMs = (int)($endOfDay->getTimestamp() * 1000);
+
+    $stepDataSourceId = $config['fit_step_data_source'] ?? 'derived:com.google.step_count.delta:com.google.android.gms:merge_step_deltas';
+    $distanceDataSourceId = $config['fit_distance_data_source'] ?? 'derived:com.google.distance.delta:com.google.android.gms:merge_distance_delta';
 
     $requestBody = [
         'aggregateBy' => [
             [
-                'dataTypeName' => 'com.google.step_count.delta',
+                'dataSourceId' => $stepDataSourceId,
             ],
             [
-                'dataTypeName' => 'com.google.distance.delta',
+                'dataSourceId' => $distanceDataSourceId,
             ],
             [
                 // Uncomment to include calories data
@@ -467,7 +509,7 @@ function fetchAggregatedFitnessData($config, $date = null) {
 /**
  * Export daily step and distance totals from a start date to CSV
  */
-function fetchDailyDataRangeToCsv($config, $startDate, $endDate = null, $outputPath = null) {
+function fetchDailyDataRangeToCsv($config, $startDate, $endDate = null, $outputPath = null, $debugMode = false) {
     if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $startDate)) {
         echo "Invalid start date format. Use YYYY-MM-DD\n";
         exit(1);
@@ -513,7 +555,32 @@ function fetchDailyDataRangeToCsv($config, $startDate, $endDate = null, $outputP
     while ($cursor <= $end) {
         $currentDate = $cursor->format('Y-m-d');
         $data = fetchAggregatedFitnessData($config, $currentDate);
-        $totals = extractDailyTotals($data);
+
+        $preferredDistanceMeters = null;
+        $preferredDistanceSources = [];
+        $distanceSourceInclude = $config['distance_source_include_contains'] ?? ($config['preferred_distance_source_contains'] ?? null);
+        $distanceSourceExclude = $config['distance_source_exclude_contains'] ?? null;
+        $hasSourceFilter = (is_string($distanceSourceInclude) && $distanceSourceInclude !== '')
+            || (is_array($distanceSourceInclude) && !empty($distanceSourceInclude))
+            || (is_string($distanceSourceExclude) && $distanceSourceExclude !== '')
+            || (is_array($distanceSourceExclude) && !empty($distanceSourceExclude));
+
+        if ($hasSourceFilter) {
+            $preferredDistanceResult = fetchDistanceFromMatchingRawSources(
+                $config,
+                $currentDate,
+                $distanceSourceInclude,
+                $distanceSourceExclude,
+                $debugMode
+            );
+            $preferredDistanceSources = $preferredDistanceResult['matched_sources'];
+                $preferredDistanceSourceTotals = $preferredDistanceResult['matched_source_totals'];
+            if ($preferredDistanceResult['distance_meters'] > 0) {
+                $preferredDistanceMeters = $preferredDistanceResult['distance_meters'];
+            }
+        }
+
+            $totals = extractDailyTotals($data, $debugMode, $currentDate, $preferredDistanceMeters, $preferredDistanceSources, $preferredDistanceSourceTotals ?? [], $config);
 
         fputcsv($csvHandle, [
             $currentDate,
@@ -601,42 +668,289 @@ function fetchDailyDataRangeToCsv($config, $startDate, $endDate = null, $outputP
 }
 
 /**
+ * Fetch distance from raw data sources using include/exclude source filters
+ */
+function fetchDistanceFromMatchingRawSources($config, $date, $sourceContains = null, $sourceExcludes = null, $debugMode = false) {
+    if (!file_exists($config['token_file'])) {
+        return [
+            'distance_meters' => 0.0,
+            'matched_sources' => [],
+            'matched_source_totals' => [],
+        ];
+    }
+
+    $tokenData = json_decode(file_get_contents($config['token_file']), true);
+    $accessToken = $tokenData['access_token'] ?? null;
+    if (!$accessToken) {
+        return [
+            'distance_meters' => 0.0,
+            'matched_sources' => [],
+            'matched_source_totals' => [],
+        ];
+    }
+
+    $timezone = resolveConfiguredTimezone($config);
+    $startOfDay = new DateTime($date . ' 00:00:00', $timezone);
+    $endOfDay = (clone $startOfDay)->modify('+1 day');
+    $startNs = (int)($startOfDay->getTimestamp() * 1000000000);
+    $endNs = (int)($endOfDay->getTimestamp() * 1000000000);
+    $datasetId = $startNs . '-' . $endNs;
+
+    $dataSourcesResponse = googleFitApiGetJson($config, 'https://www.googleapis.com/fitness/v1/users/me/dataSources', $accessToken);
+    $dataSources = $dataSourcesResponse['dataSource'] ?? [];
+
+    $includePatterns = normalizeSourceFilterPatterns($sourceContains);
+    $excludePatterns = normalizeSourceFilterPatterns($sourceExcludes);
+
+    $allDistanceSources = [];
+    $matchedDistanceSources = [];
+    foreach ($dataSources as $source) {
+        $streamId = $source['dataStreamId'] ?? '';
+        $dataTypeName = $source['dataType']['name'] ?? '';
+
+        if ($dataTypeName !== 'com.google.distance.delta') {
+            continue;
+        }
+
+        $allDistanceSources[] = $streamId;
+
+        $matchesInclude = empty($includePatterns) ? true : sourceMatchesAnyPattern($streamId, $includePatterns);
+        $matchesExclude = !empty($excludePatterns) && sourceMatchesAnyPattern($streamId, $excludePatterns);
+
+        if ($matchesInclude && !$matchesExclude) {
+            $matchedDistanceSources[] = $streamId;
+        }
+    }
+
+    $distanceMeters = 0.0;
+    $matchedSourceTotals = [];
+    foreach ($matchedDistanceSources as $streamId) {
+        $datasetUrl = 'https://www.googleapis.com/fitness/v1/users/me/dataSources/' . rawurlencode($streamId) . '/datasets/' . $datasetId;
+        $datasetResponse = googleFitApiGetJson($config, $datasetUrl, $accessToken);
+
+        $sourceMeters = 0.0;
+
+        if (!empty($datasetResponse['point'])) {
+            foreach ($datasetResponse['point'] as $point) {
+                foreach (($point['value'] ?? []) as $value) {
+                    if (isset($value['fpVal'])) {
+                        $sourceMeters += (float)$value['fpVal'];
+                    } elseif (isset($value['intVal'])) {
+                        $sourceMeters += (float)$value['intVal'];
+                    }
+                }
+            }
+        }
+
+        $distanceMeters += $sourceMeters;
+        $matchedSourceTotals[$streamId] = $sourceMeters;
+    }
+
+    if ($debugMode) {
+        echo "  raw distance sources: " . (empty($allDistanceSources) ? 'none' : implode(', ', $allDistanceSources)) . "\n";
+        echo "  preferred raw matches: " . (empty($matchedDistanceSources) ? 'none' : implode(', ', $matchedDistanceSources)) . "\n";
+        if (!empty($matchedDistanceSources)) {
+            $distanceMiles = $distanceMeters * 0.000621371;
+            echo "  preferred raw distance: " . round($distanceMeters, 2) . " m (" . round($distanceMiles, 2) . " mi)\n";
+        }
+    }
+
+    return [
+        'distance_meters' => $distanceMeters,
+        'matched_sources' => $matchedDistanceSources,
+        'matched_source_totals' => $matchedSourceTotals,
+    ];
+}
+
+/**
+ * Perform a Google Fit API GET and decode JSON response
+ */
+function googleFitApiGetJson($config, $url, $accessToken) {
+    $ch = curl_init($url);
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    curl_setopt($ch, CURLOPT_HTTPHEADER, [
+        'Authorization: Bearer ' . $accessToken,
+    ]);
+
+    $caBundle = __DIR__ . '/cacert.pem';
+    if (file_exists($caBundle)) {
+        curl_setopt($ch, CURLOPT_CAINFO, $caBundle);
+    } else {
+        curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
+        curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, 0);
+    }
+
+    $response = curl_exec($ch);
+    $curlError = curl_error($ch);
+    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    curl_close($ch);
+
+    if ($curlError || $httpCode !== 200 || !$response) {
+        return [];
+    }
+
+    $decoded = json_decode($response, true);
+    return is_array($decoded) ? $decoded : [];
+}
+
+/**
+ * Normalize include/exclude source filter values to array
+ */
+function normalizeSourceFilterPatterns($value) {
+    if (is_array($value)) {
+        return array_values(array_filter(array_map('strval', $value), function ($item) {
+            return $item !== '';
+        }));
+    }
+
+    if (is_string($value) && $value !== '') {
+        return [$value];
+    }
+
+    return [];
+}
+
+/**
+ * Case-insensitive source id match against filter patterns
+ */
+function sourceMatchesAnyPattern($sourceId, $patterns) {
+    foreach ($patterns as $pattern) {
+        if (stripos($sourceId, $pattern) !== false) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+/**
+ * Sum numeric point values in a dataset
+ */
+function sumDatasetPointValues($dataset) {
+    $total = 0.0;
+
+    if (empty($dataset['point'])) {
+        return $total;
+    }
+
+    foreach ($dataset['point'] as $point) {
+        foreach ($point['value'] as $value) {
+            if (isset($value['intVal'])) {
+                $total += (float)$value['intVal'];
+            } elseif (isset($value['fpVal'])) {
+                $total += (float)$value['fpVal'];
+            }
+        }
+    }
+
+    return $total;
+}
+
+/**
  * Extract daily step and distance totals from an aggregate response
  */
-function extractDailyTotals($data) {
-    $steps = 0;
-    $distanceMeters = 0.0;
+function extractDailyTotals($data, $debugMode = false, $dateLabel = null, $preferredDistanceMeters = null, $preferredDistanceSources = [], $preferredDistanceSourceTotals = [], $config = []) {
+    $stepsFromMerged = 0.0;
+    $distanceFromMergedMeters = 0.0;
+    $stepsFromAllSources = 0.0;
+    $distanceFromAllSourcesMeters = 0.0;
+    $hasMergedSteps = false;
+    $hasMergedDistance = false;
+    $debugRows = [];
+    $distanceBySource = [];
 
     if (isset($data['bucket']) && !empty($data['bucket'])) {
         foreach ($data['bucket'] as $bucket) {
             foreach ($bucket['dataset'] as $dataset) {
                 $dataType = $dataset['dataSourceId'] ?? '';
 
-                if (!empty($dataset['point'])) {
-                    foreach ($dataset['point'] as $point) {
-                        foreach ($point['value'] as $value) {
-                            $valueNum = null;
-                            if (isset($value['intVal'])) {
-                                $valueNum = (int)$value['intVal'];
-                            } elseif (isset($value['fpVal'])) {
-                                $valueNum = (float)$value['fpVal'];
-                            }
+                $datasetTotal = sumDatasetPointValues($dataset);
+                if ($datasetTotal === 0.0) {
+                    continue;
+                }
 
-                            if ($valueNum !== null) {
-                                if (strpos($dataType, 'step_count.delta') !== false) {
-                                    $steps += (int)$valueNum;
-                                } elseif (strpos($dataType, 'distance.delta') !== false) {
-                                    $distanceMeters += (float)$valueNum;
-                                }
-                            }
-                        }
+                $isMergedDataset = false;
+                $metric = null;
+
+                if (strpos($dataType, 'step_count.delta') !== false) {
+                    $metric = 'steps';
+                    $stepsFromAllSources += $datasetTotal;
+                    if (strpos($dataType, 'merge_step_deltas') !== false) {
+                        $hasMergedSteps = true;
+                        $stepsFromMerged += $datasetTotal;
+                        $isMergedDataset = true;
                     }
+                } elseif (strpos($dataType, 'distance.delta') !== false) {
+                    $metric = 'distance';
+                    $distanceFromAllSourcesMeters += $datasetTotal;
+                    if (!isset($distanceBySource[$dataType])) {
+                        $distanceBySource[$dataType] = 0.0;
+                    }
+                    $distanceBySource[$dataType] += $datasetTotal;
+                    if (strpos($dataType, 'merge_distance_delta') !== false) {
+                        $hasMergedDistance = true;
+                        $distanceFromMergedMeters += $datasetTotal;
+                        $isMergedDataset = true;
+                    }
+                }
+
+                if ($debugMode && $metric !== null) {
+                    $debugRows[] = [
+                        'metric' => $metric,
+                        'source' => $dataType,
+                        'is_merged' => $isMergedDataset,
+                        'value' => $datasetTotal,
+                    ];
                 }
             }
         }
     }
 
+    $steps = $hasMergedSteps ? (int)round($stepsFromMerged) : (int)round($stepsFromAllSources);
+    $distanceMeters = $hasMergedDistance ? $distanceFromMergedMeters : $distanceFromAllSourcesMeters;
+    $distanceSelectionMode = $hasMergedDistance ? 'merged' : 'all_sources_fallback';
+    if ($preferredDistanceMeters !== null && $preferredDistanceMeters > 0) {
+        $distanceMeters = $preferredDistanceMeters;
+        $distanceSelectionMode = 'preferred_raw_source_filter';
+    }
+
+    $distanceMode = $config['distance_mode'] ?? 'api';
+    if ($distanceMode === 'steps_estimate') {
+        $stepLengthMeters = isset($config['step_length_meters']) ? (float)$config['step_length_meters'] : 0.4315;
+        if ($stepLengthMeters > 0) {
+            $distanceMeters = $steps * $stepLengthMeters;
+            $distanceSelectionMode = 'steps_estimate';
+        }
+    }
+
     $distanceMiles = $distanceMeters * 0.000621371;
+
+    if ($debugMode) {
+        $label = $dateLabel ?? 'unknown-date';
+        echo "\n[DEBUG] Daily source breakdown for $label\n";
+        foreach ($debugRows as $row) {
+            if ($row['metric'] === 'steps') {
+                echo "  steps | " . ($row['is_merged'] ? 'MERGED ' : 'SOURCE ') . "| " . (int)round($row['value']) . " | " . $row['source'] . "\n";
+            } else {
+                $miles = $row['value'] * 0.000621371;
+                echo "  dist  | " . ($row['is_merged'] ? 'MERGED ' : 'SOURCE ') . "| " . round($row['value'], 2) . " m (" . round($miles, 2) . " mi) | " . $row['source'] . "\n";
+            }
+        }
+
+        echo "  chosen steps source: " . ($hasMergedSteps ? 'merged' : 'all_sources_fallback') . " => $steps\n";
+        echo "  chosen dist source:  " . $distanceSelectionMode . " => " . round($distanceMeters, 2) . " m (" . round($distanceMiles, 2) . " mi)\n";
+        if ($distanceSelectionMode === 'steps_estimate') {
+            $stepLengthMeters = isset($config['step_length_meters']) ? (float)$config['step_length_meters'] : 0.4315;
+            echo "  steps estimate config: step_length_meters=" . round($stepLengthMeters, 4) . "\n";
+        }
+        if (!empty($preferredDistanceSources)) {
+            echo "  preferred dist sources used: " . implode(', ', $preferredDistanceSources) . "\n";
+            foreach ($preferredDistanceSourceTotals as $sourceId => $sourceMeters) {
+                $sourceMiles = $sourceMeters * 0.000621371;
+                echo "    - " . round($sourceMeters, 2) . " m (" . round($sourceMiles, 2) . " mi) | " . $sourceId . "\n";
+            }
+        }
+    }
 
     return [
         'steps' => $steps,
