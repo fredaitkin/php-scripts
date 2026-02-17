@@ -558,6 +558,13 @@ function fetchDailyDataRangeToCsv($config, $startDate, $endDate = null, $outputP
 
         $preferredDistanceMeters = null;
         $preferredDistanceSources = [];
+        $activityFilteredDistanceMeters = null;
+        $distanceMode = $config['distance_mode'] ?? 'api';
+
+        if ($distanceMode === 'activity_filtered') {
+            $activityFilteredDistanceMeters = fetchActivityFilteredDistanceMeters($config, $currentDate, $debugMode);
+        }
+
         $distanceSourceInclude = $config['distance_source_include_contains'] ?? ($config['preferred_distance_source_contains'] ?? null);
         $distanceSourceExclude = $config['distance_source_exclude_contains'] ?? null;
         $hasSourceFilter = (is_string($distanceSourceInclude) && $distanceSourceInclude !== '')
@@ -578,6 +585,11 @@ function fetchDailyDataRangeToCsv($config, $startDate, $endDate = null, $outputP
             if ($preferredDistanceResult['distance_meters'] > 0) {
                 $preferredDistanceMeters = $preferredDistanceResult['distance_meters'];
             }
+        }
+
+        if ($activityFilteredDistanceMeters !== null && $activityFilteredDistanceMeters > 0) {
+            $preferredDistanceMeters = $activityFilteredDistanceMeters;
+            $preferredDistanceSources = ['activity_filtered'];
         }
 
             $totals = extractDailyTotals($data, $debugMode, $currentDate, $preferredDistanceMeters, $preferredDistanceSources, $preferredDistanceSourceTotals ?? [], $config);
@@ -794,6 +806,123 @@ function googleFitApiGetJson($config, $url, $accessToken) {
 }
 
 /**
+ * Perform a Google Fit API POST with JSON body and decode JSON response
+ */
+function googleFitApiPostJson($config, $url, $accessToken, $requestBody) {
+    $ch = curl_init($url);
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    curl_setopt($ch, CURLOPT_POST, true);
+    curl_setopt($ch, CURLOPT_HTTPHEADER, [
+        'Content-Type: application/json',
+        'Authorization: Bearer ' . $accessToken,
+    ]);
+    curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($requestBody));
+
+    $caBundle = __DIR__ . '/cacert.pem';
+    if (file_exists($caBundle)) {
+        curl_setopt($ch, CURLOPT_CAINFO, $caBundle);
+    } else {
+        curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
+        curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, 0);
+    }
+
+    $response = curl_exec($ch);
+    $curlError = curl_error($ch);
+    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    curl_close($ch);
+
+    if ($curlError || $httpCode !== 200 || !$response) {
+        return [];
+    }
+
+    $decoded = json_decode($response, true);
+    return is_array($decoded) ? $decoded : [];
+}
+
+/**
+ * Fetch distance by activity buckets and include configured activity types only
+ */
+function fetchActivityFilteredDistanceMeters($config, $date, $debugMode = false) {
+    if (!file_exists($config['token_file'])) {
+        return null;
+    }
+
+    $tokenData = json_decode(file_get_contents($config['token_file']), true);
+    $accessToken = $tokenData['access_token'] ?? null;
+    if (!$accessToken) {
+        return null;
+    }
+
+    $timezone = resolveConfiguredTimezone($config);
+    $startOfDay = new DateTime($date . ' 00:00:00', $timezone);
+    $endOfDay = (clone $startOfDay)->modify('+1 day');
+    $startMs = (int)($startOfDay->getTimestamp() * 1000);
+    $endMs = (int)($endOfDay->getTimestamp() * 1000);
+
+    $distanceDataSourceId = $config['fit_distance_data_source'] ?? 'derived:com.google.distance.delta:com.google.android.gms:merge_distance_delta';
+    $activityTypes = $config['activity_distance_include_types'] ?? [7, 8];
+    if (!is_array($activityTypes) || empty($activityTypes)) {
+        $activityTypes = [7, 8];
+    }
+    $activityTypes = array_values(array_map('intval', $activityTypes));
+
+    $requestBody = [
+        'aggregateBy' => [
+            [
+                'dataSourceId' => $distanceDataSourceId,
+            ],
+        ],
+        'bucketByActivityType' => [
+            'minDurationMillis' => 1,
+        ],
+        'startTimeMillis' => $startMs,
+        'endTimeMillis' => $endMs,
+    ];
+
+    $response = googleFitApiPostJson(
+        $config,
+        'https://www.googleapis.com/fitness/v1/users/me/dataset:aggregate',
+        $accessToken,
+        $requestBody
+    );
+
+    if (empty($response['bucket'])) {
+        return 0.0;
+    }
+
+    $includedMeters = 0.0;
+    if ($debugMode) {
+        echo "  activity distance include types: " . implode(', ', $activityTypes) . "\n";
+    }
+
+    foreach ($response['bucket'] as $bucket) {
+        $activityType = isset($bucket['activity']) ? (int)$bucket['activity'] : -1;
+        $bucketMeters = 0.0;
+
+        foreach (($bucket['dataset'] ?? []) as $dataset) {
+            $bucketMeters += sumDatasetPointValues($dataset);
+        }
+
+        $isIncluded = in_array($activityType, $activityTypes, true);
+        if ($isIncluded) {
+            $includedMeters += $bucketMeters;
+        }
+
+        if ($debugMode) {
+            $bucketMiles = $bucketMeters * 0.000621371;
+            echo "  activity bucket | type " . $activityType . " | " . ($isIncluded ? 'INCLUDE' : 'SKIP') . " | " . round($bucketMeters, 2) . " m (" . round($bucketMiles, 2) . " mi)\n";
+        }
+    }
+
+    if ($debugMode) {
+        $includedMiles = $includedMeters * 0.000621371;
+        echo "  activity filtered distance: " . round($includedMeters, 2) . " m (" . round($includedMiles, 2) . " mi)\n";
+    }
+
+    return $includedMeters;
+}
+
+/**
  * Normalize include/exclude source filter values to array
  */
 function normalizeSourceFilterPatterns($value) {
@@ -908,13 +1037,15 @@ function extractDailyTotals($data, $debugMode = false, $dateLabel = null, $prefe
 
     $steps = $hasMergedSteps ? (int)round($stepsFromMerged) : (int)round($stepsFromAllSources);
     $distanceMeters = $hasMergedDistance ? $distanceFromMergedMeters : $distanceFromAllSourcesMeters;
+    $distanceMode = $config['distance_mode'] ?? 'api';
     $distanceSelectionMode = $hasMergedDistance ? 'merged' : 'all_sources_fallback';
     if ($preferredDistanceMeters !== null && $preferredDistanceMeters > 0) {
         $distanceMeters = $preferredDistanceMeters;
-        $distanceSelectionMode = 'preferred_raw_source_filter';
+        $distanceSelectionMode = ($distanceMode ?? 'api') === 'activity_filtered'
+            ? 'activity_filtered'
+            : 'preferred_raw_source_filter';
     }
 
-    $distanceMode = $config['distance_mode'] ?? 'api';
     if ($distanceMode === 'steps_estimate') {
         $stepLengthMeters = isset($config['step_length_meters']) ? (float)$config['step_length_meters'] : 0.4315;
         if ($stepLengthMeters > 0) {

@@ -25,6 +25,9 @@ return [
     // 'distance_source_exclude_contains' => ['lifefitness'],
     // Optional: distance calculation mode: 'api' (default) or 'steps_estimate'
     // 'distance_mode' => 'steps_estimate',
+    // Optional: sum distance only for selected activity types (uses aggregate bucketByActivityType)
+    // 'distance_mode' => 'activity_filtered',
+    // 'activity_distance_include_types' => [7, 8, 58], // walking, running, lifefitness treadmill
     // Optional: meters per step used when distance_mode='steps_estimate'
     // 0.4315 gives ~1.05 mi for 3915 steps
     // 'step_length_meters' => 0.4315,
