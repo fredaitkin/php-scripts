@@ -39,7 +39,8 @@ if (!isset($argv[1])) {
 }
 
 $command = $argv[1];
-$date = isset($argv[2]) ? $argv[2] : date('Y-m-d'); // Get date parameter or use today
+$defaultTimezone = resolveConfiguredTimezone($config);
+$date = isset($argv[2]) ? $argv[2] : (new DateTime('now', $defaultTimezone))->format('Y-m-d'); // Get date parameter or use today
 
 if ($command === 'auth') {
     handleAuthorization($config);
@@ -289,16 +290,36 @@ function ensureValidAccessToken($config) {
 }
 
 /**
+ * Resolve configured timezone with safe UTC fallback
+ */
+function resolveConfiguredTimezone($config) {
+    $timezoneName = $config['timezone'] ?? date_default_timezone_get();
+
+    try {
+        return new DateTimeZone($timezoneName);
+    } catch (Exception $e) {
+        echo "Warning: Invalid timezone '$timezoneName'. Falling back to UTC.\n";
+        return new DateTimeZone('UTC');
+    }
+}
+
+/**
  * Step 3: Fetch fitness data from Google Fit API
  */
 function fetchFitnessData($config, $date = null) {
     $data = fetchAggregatedFitnessData($config, $date);
+
+    $timezone = resolveConfiguredTimezone($config);
     
     echo "=== Google Fit Data ===\n\n";
     
     if (isset($data['bucket']) && !empty($data['bucket'])) {
         foreach ($data['bucket'] as $bucket) {
-            echo "Date: " . date('Y-m-d', $bucket['startTimeMillis'] / 1000) . "\n";
+            $bucketStartTimestamp = (int)($bucket['startTimeMillis'] / 1000);
+            $bucketDate = (new DateTime('@' . $bucketStartTimestamp))
+                ->setTimezone($timezone)
+                ->format('Y-m-d');
+            echo "Date: " . $bucketDate . "\n";
             
             foreach ($bucket['dataset'] as $dataset) {
                 $dataType = $dataset['dataSourceId'] ?? 'Unknown';
@@ -358,13 +379,7 @@ function fetchAggregatedFitnessData($config, $date = null) {
     $tokenData = json_decode(file_get_contents($config['token_file']), true);
     $accessToken = $tokenData['access_token'];
 
-    $timezoneName = $config['timezone'] ?? date_default_timezone_get();
-    try {
-        $timezone = new DateTimeZone($timezoneName);
-    } catch (Exception $e) {
-        echo "Warning: Invalid timezone '$timezoneName'. Falling back to UTC.\n";
-        $timezone = new DateTimeZone('UTC');
-    }
+    $timezone = resolveConfiguredTimezone($config);
 
     $startOfDay = new DateTime($date . ' 00:00:00', $timezone);
     $endOfDay = new DateTime($date . ' 23:59:59', $timezone);
@@ -458,8 +473,10 @@ function fetchDailyDataRangeToCsv($config, $startDate, $endDate = null, $outputP
         exit(1);
     }
 
+    $timezone = resolveConfiguredTimezone($config);
+
     if ($endDate === null) {
-        $endDate = date('Y-m-d');
+        $endDate = (new DateTime('now', $timezone))->format('Y-m-d');
     }
 
     if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $endDate)) {
@@ -467,8 +484,8 @@ function fetchDailyDataRangeToCsv($config, $startDate, $endDate = null, $outputP
         exit(1);
     }
 
-    $start = new DateTime($startDate . ' 00:00:00');
-    $end = new DateTime($endDate . ' 00:00:00');
+    $start = new DateTime($startDate . ' 00:00:00', $timezone);
+    $end = new DateTime($endDate . ' 00:00:00', $timezone);
 
     if ($end < $start) {
         echo "End date cannot be earlier than start date.\n";
