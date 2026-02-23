@@ -1,3 +1,5 @@
 google-fit/google_fit_config.php
 google-fit/google_fit_token.json
 google-fit/*.csv
+google-fit/*.log
+google-fit/google_fit_email_config.ps1
