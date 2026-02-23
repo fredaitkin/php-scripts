@@ -1,3 +1,3 @@
 google-fit/google_fit_config.php
 google-fit/google_fit_token.json
-google-fit/google_fit_daily*.csv
+google-fit/*.csv

@@ -8,7 +8,7 @@
  * Usage:
  * 1. Set your credentials in the config section below
  * 2. Run: php google_fit_connector.php auth    (to get authorization)
- * 3. Run: php google_fit_connector.php data    (to fetch fitness data)
+ * 3. Run: php google_fit_connector.php load    (to fetch fitness data)
  */
 
 // ============================================================================
@@ -32,37 +32,32 @@ $config = require $configFile;
 if (!isset($argv[1])) {
     echo "Usage:\n";
     echo "  php google_fit_connector.php auth              - Get authorization code\n";
-    echo "  php google_fit_connector.php data [DATE]       - Fetch fitness data (DATE format: YYYY-MM-DD, default: today)\n";
-    echo "  php google_fit_connector.php auto [DATE]       - Refresh token and fetch data (DATE format: YYYY-MM-DD, default: today)\n";
-    echo "  php google_fit_connector.php csv START_DATE [END_DATE] [OUTPUT_PATH] - Export daily data to CSV\n";
+    echo "  php google_fit_connector.php load [DATE]       - Load fitness data (DATE format: YYYY-MM-DD; if omitted, uses day after latest DB row)\n";
+    echo "  php google_fit_connector.php csv [OUTPUT_PATH] - Export measurements table to CSV\n";
     exit(1);
 }
 
 $command = $argv[1];
 $defaultTimezone = resolveConfiguredTimezone($config);
-$date = isset($argv[2]) ? $argv[2] : (new DateTime('now', $defaultTimezone))->format('Y-m-d'); // Get date parameter or use today
+$date = isset($argv[2]) ? $argv[2] : null;
 
 if ($command === 'auth') {
     handleAuthorization($config);
-} elseif ($command === 'data') {
-    fetchFitnessData($config, $date);
-} elseif ($command === 'auto') {
-    autoRefreshAndFetchData($config, $date);
-} elseif ($command === 'csv' && isset($argv[2])) {
-    $startDate = $argv[2];
-    $endDate = isset($argv[3]) ? $argv[3] : null;
-    $outputPath = isset($argv[4]) ? $argv[4] : null;
+} elseif ($command === 'load') {
     ensureValidAccessToken($config);
-    fetchDailyDataRangeToCsv($config, $startDate, $endDate, $outputPath);
+    load($config, $date);
+} elseif ($command === 'csv') {
+    ensureValidAccessToken($config);
+    $outputPath = isset($argv[2]) ? $argv[2] : null;
+    exportMeasurementsToCsv($config, $outputPath);
 } elseif ($command === 'token' && isset($argv[2])) {
     exchangeTokenFromCode($config, $argv[2]);
 } else {
     echo "Usage:\n";
     echo "  php google_fit_connector.php auth              - Get authorization code\n";
     echo "  php google_fit_connector.php token CODE        - Exchange code for token\n";
-    echo "  php google_fit_connector.php data [DATE]       - Fetch fitness data (DATE format: YYYY-MM-DD, default: today)\n";
-    echo "  php google_fit_connector.php auto [DATE]       - Refresh token and fetch data (DATE format: YYYY-MM-DD, default: today)\n";
-    echo "  php google_fit_connector.php csv START_DATE [END_DATE] [OUTPUT_PATH] - Export daily data to CSV\n";
+    echo "  php google_fit_connector.php load [DATE]       - Load fitness data (DATE format: YYYY-MM-DD; if omitted, uses day after latest DB row)\n";
+    echo "  php google_fit_connector.php csv [OUTPUT_PATH] - Export measurements table to CSV\n";
     exit(1);
 }
 
@@ -145,57 +140,7 @@ function exchangeTokenFromCode($config, $authCode) {
     // Save token to file
     file_put_contents($config['token_file'], json_encode($tokenData, JSON_PRETTY_PRINT));
     echo "Token saved! You can now fetch data.\n";
-    echo "Run: php google_fit_connector.php data\n";
-    echo "Or use automated mode: php google_fit_connector.php auto\n";
-}
-
-/**
- * Automatic token refresh and data fetch in one command
- */
-function autoRefreshAndFetchData($config, $date = null) {
-    if ($date === null) {
-        $date = date('Y-m-d');
-    }
-    echo "Starting automated Google Fit data retrieval for " . $date . "...\n\n";
-    
-    // Check if token file exists
-    if (!file_exists($config['token_file'])) {
-        echo "Error: No token found at " . $config['token_file'] . "\n";
-        echo "You must complete the initial authorization first:\n";
-        echo "  1. php google_fit_connector.php auth\n";
-        echo "  2. Visit the provided URL and authorize\n";
-        echo "  3. Copy the authorization code\n";
-        echo "  4. php google_fit_connector.php token YOUR_AUTH_CODE\n";
-        exit(1);
-    }
-
-    // Load and check token
-    $tokenData = json_decode(file_get_contents($config['token_file']), true);
-    
-    if (!isset($tokenData['refresh_token'])) {
-        echo "Error: Refresh token not found in token file.\n";
-        echo "Please re-authorize: php google_fit_connector.php auth\n";
-        exit(1);
-    }
-
-    // Check if token is expired and refresh if needed
-    $tokenExpiresAt = $tokenData['expires_at'] ?? 0;
-    $now = time();
-
-    if ($now > $tokenExpiresAt - 300) { // Refresh if expiring within 5 minutes
-        echo "Token expired or expiring soon. Refreshing...\n";
-        refreshAccessToken($config, $tokenData);
-        echo "Token refreshed successfully.\n\n";
-        
-        // Reload token data after refresh
-        $tokenData = json_decode(file_get_contents($config['token_file']), true);
-    } else {
-        $secondsLeft = $tokenExpiresAt - $now;
-        echo "Token is valid (expires in ~" . round($secondsLeft / 60) . " minutes).\n\n";
-    }
-
-    // Now fetch the fitness data
-    fetchFitnessData($config, $date);
+    echo "Run: php google_fit_connector.php load\n";
 }
 
 /**
@@ -304,15 +249,91 @@ function resolveConfiguredTimezone($config) {
 }
 
 /**
- * Step 3: Fetch fitness data from Google Fit API
+ * Convert Google data source IDs to short output labels
  */
-function fetchFitnessData($config, $date = null) {
-    $data = fetchAggregatedFitnessData($config, $date);
+function formatDataTypeLabel($dataType) {
+    if (preg_match('/([a-z_]+)\.delta/', $dataType, $matches)) {
+        return $matches[1];
+    }
+
+    return $dataType;
+}
+
+/**
+ * Step 3: Load fitness data from Google Fit API
+ */
+function load($config, $date = null) {
+    if ($date === null || trim($date) === '') {
+        $date = resolveLoadStartDateFromMeasurements($config);
+    }
+
+    if (startDateHasBeenProcessed($config, $date)) {
+        echo "Error: start date {$date} is earlier than the latest date in measurements table.\n";
+        exit(1);
+    }
 
     $timezone = resolveConfiguredTimezone($config);
-    
-    echo "=== Google Fit Data ===\n\n";
-    
+
+    $startDate = new DateTime($date . ' 00:00:00', $timezone);
+    $endDate = new DateTime('yesterday', $timezone);
+    $endDate->setTime(0, 0, 0);
+
+    if ($startDate > $endDate) {
+        echo "No dates to load. Start date " . $startDate->format('Y-m-d') . " is after previous day " . $endDate->format('Y-m-d') . ".\n";
+        return;
+    }
+
+    $allMeasurements = [];
+    $cursor = clone $startDate;
+    while ($cursor <= $endDate) {
+        $currentDate = $cursor->format('Y-m-d');
+        $data = fetchAggregatedFitnessData($config, $currentDate);
+
+        $measurements = buildMeasurementsFromAggregateData($data, $timezone);
+        if (!empty($measurements)) {
+            $allMeasurements = array_merge($allMeasurements, $measurements);
+        }
+
+        echo "=== Google Fit Data ({$currentDate}) ===\n\n";
+        printLoadOutput($data, $timezone);
+        echo "\n";
+
+        $cursor->modify('+1 day');
+    }
+
+    insertMeasurements($config, $allMeasurements);
+}
+
+/**
+ * Check whether a start date is earlier than max measurements date
+ */
+function startDateHasBeenProcessed($config, $date) {
+    try {
+        $pdo = getDatabaseConnection($config);
+        $stmt = $pdo->query('SELECT MAX(`date`) AS max_date FROM measurements');
+        $row = $stmt->fetch();
+        $maxDate = $row['max_date'] ?? null;
+
+        if ($maxDate === null) {
+            return false;
+        }
+
+        $timezone = resolveConfiguredTimezone($config);
+        $startDate = new DateTime($date . ' 00:00:00', $timezone);
+        $maxDateObj = new DateTime($maxDate, $timezone);
+        $maxDateObj->setTime(0, 0, 0);
+
+        return $startDate < $maxDateObj;
+    } catch (Exception $e) {
+        echo "Error: Unable to validate start date in measurements table: " . $e->getMessage() . "\n";
+        exit(1);
+    }
+}
+
+/**
+ * Print load output for aggregate API data
+ */
+function printLoadOutput($data, $timezone) {
     if (isset($data['bucket']) && !empty($data['bucket'])) {
         foreach ($data['bucket'] as $bucket) {
             $bucketStartTimestamp = (int)($bucket['startTimeMillis'] / 1000);
@@ -320,33 +341,28 @@ function fetchFitnessData($config, $date = null) {
                 ->setTimezone($timezone)
                 ->format('Y-m-d');
             echo "Date: " . $bucketDate . "\n";
-            
+
             foreach ($bucket['dataset'] as $dataset) {
                 $dataType = $dataset['dataSourceId'] ?? 'Unknown';
-                
+                $outputLabel = formatDataTypeLabel($dataType);
+
                 if (!empty($dataset['point'])) {
                     foreach ($dataset['point'] as $point) {
                         foreach ($point['value'] as $value) {
                             if (isset($value['intVal'])) {
                                 $intValue = $value['intVal'];
-                                echo "  " . $dataType . ": " . $intValue;
-                                
-                                // Convert distance from meters to miles if applicable
                                 if (strpos($dataType, 'distance.delta') !== false) {
-                                    $miles = $intValue * 0.000621371;
-                                    echo " meters (" . round($miles, 2) . " miles)";
+                                    echo "  " . $outputLabel . ": " . round((float)$intValue) . "\n";
+                                } else {
+                                    echo "  " . $outputLabel . ": " . $intValue . "\n";
                                 }
-                                echo "\n";
                             } elseif (isset($value['fpVal'])) {
                                 $fpValue = $value['fpVal'];
-                                echo "  " . $dataType . ": " . round($fpValue, 2);
-                                
-                                // Convert distance from meters to miles if applicable
                                 if (strpos($dataType, 'distance.delta') !== false) {
-                                    $miles = $fpValue * 0.000621371;
-                                    echo " meters (" . round($miles, 2) . " miles)";
+                                    echo "  " . $outputLabel . ": " . round($fpValue) . "\n";
+                                } else {
+                                    echo "  " . $outputLabel . ": " . round($fpValue, 2) . "\n";
                                 }
-                                echo "\n";
                             }
                         }
                     }
@@ -355,6 +371,119 @@ function fetchFitnessData($config, $date = null) {
         }
     } else {
         echo "No data found.\n";
+    }
+}
+
+/**
+ * Resolve load start date from max measurements.date + 1 day
+ */
+function resolveLoadStartDateFromMeasurements($config) {
+    $pdo = getDatabaseConnection($config);
+
+    try {
+        $stmt = $pdo->query('SELECT MAX(`date`) AS max_date FROM measurements');
+        $row = $stmt->fetch();
+        $maxDate = $row['max_date'] ?? null;
+
+        if ($maxDate === null) {
+            echo "Error: start date is required.\n";
+            exit(1);
+        }
+
+        $timezone = resolveConfiguredTimezone($config);
+        $startDate = new DateTime($maxDate, $timezone);
+        $startDate->modify('+1 day');
+
+        return $startDate->format('Y-m-d');
+    } catch (Exception $e) {
+        echo "Error: Unable to resolve start date from measurements table: " . $e->getMessage() . "\n";
+        exit(1);
+    }
+}
+
+/**
+ * Create and return PDO connection from config
+ */
+function getDatabaseConnection($config) {
+    if (!isset($config['db']) || !is_array($config['db'])) {
+        echo "Error: DB config missing.\n";
+        exit(1);
+    }
+
+    $db = $config['db'];
+    $host = $db['host'] ?? '127.0.0.1';
+    $port = $db['port'] ?? 3306;
+    $database = $db['database'] ?? 'fitness';
+    $username = $db['username'] ?? '';
+    $password = $db['password'] ?? '';
+
+    if ($username === '') {
+        echo "Error: DB username missing.\n";
+        exit(1);
+    }
+
+    try {
+        $dsn = "mysql:host={$host};port={$port};dbname={$database};charset=utf8mb4";
+        return new PDO($dsn, $username, $password, [
+            PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+            PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+        ]);
+    } catch (Exception $e) {
+        echo "Error: Failed to connect to database: " . $e->getMessage() . "\n";
+        exit(1);
+    }
+}
+
+/**
+ * Build measurement rows (date, meters, steps) from aggregate API response
+ */
+function buildMeasurementsFromAggregateData($data, $timezone) {
+    $measurements = [];
+
+    if (isset($data['bucket']) && !empty($data['bucket'])) {
+        foreach ($data['bucket'] as $bucket) {
+            $bucketStartTimestamp = (int)($bucket['startTimeMillis'] / 1000);
+            $measurementDate = (new DateTime('@' . $bucketStartTimestamp))
+                ->setTimezone($timezone)
+                ->format('Y-m-d 00:00:00');
+
+            $bucketTotals = extractDailyTotals(['bucket' => [$bucket]]);
+
+            $measurements[] = [
+                'date' => $measurementDate,
+                'meters' => (int)round($bucketTotals['distance_meters']),
+                'steps' => (int)$bucketTotals['steps'],
+            ];
+        }
+    }
+
+    return $measurements;
+}
+
+/**
+ * Insert measurement rows into MySQL measurements table
+ */
+function insertMeasurements($config, $measurements) {
+    if (empty($measurements)) {
+        return;
+    }
+
+    try {
+        $pdo = getDatabaseConnection($config);
+
+        $stmt = $pdo->prepare('INSERT INTO measurements (`date`, `meters`, `steps`) VALUES (:date, :meters, :steps)');
+
+        foreach ($measurements as $measurement) {
+            $stmt->execute([
+                ':date' => $measurement['date'],
+                ':meters' => (int)$measurement['meters'],
+                ':steps' => (int)$measurement['steps'],
+            ]);
+        }
+
+        echo "Inserted " . count($measurements) . " measurement row(s) into database.\n";
+    } catch (Exception $e) {
+        echo "Warning: Failed to insert measurements: " . $e->getMessage() . "\n";
     }
 }
 
@@ -465,139 +594,143 @@ function fetchAggregatedFitnessData($config, $date = null) {
 }
 
 /**
- * Export daily step and distance totals from a start date to CSV
+ * Export measurements table to CSV
  */
-function fetchDailyDataRangeToCsv($config, $startDate, $endDate = null, $outputPath = null) {
-    if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $startDate)) {
-        echo "Invalid start date format. Use YYYY-MM-DD\n";
-        exit(1);
-    }
-
-    $timezone = resolveConfiguredTimezone($config);
-
-    if ($endDate === null) {
-        $endDate = (new DateTime('now', $timezone))->format('Y-m-d');
-    }
-
-    if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $endDate)) {
-        echo "Invalid end date format. Use YYYY-MM-DD\n";
-        exit(1);
-    }
-
-    $start = new DateTime($startDate . ' 00:00:00', $timezone);
-    $end = new DateTime($endDate . ' 00:00:00', $timezone);
-
-    if ($end < $start) {
-        echo "End date cannot be earlier than start date.\n";
-        exit(1);
-    }
-
+function exportMeasurementsToCsv($config, $outputPath = null) {
     if ($outputPath === null) {
-        $outputPath = __DIR__ . '/google_fit_daily_' . $startDate . '_to_' . $endDate . '.csv';
+        $outputPath = __DIR__ . '/measurements_export.csv';
     }
 
-    $csvHandle = fopen($outputPath, 'w');
-    if ($csvHandle === false) {
-        echo "Unable to write CSV file to: $outputPath\n";
+    try {
+        $pdo = getDatabaseConnection($config);
+        $stmt = $pdo->query('SELECT `date`, `steps`, `meters` FROM measurements ORDER BY `date` ASC');
+        $rows = $stmt->fetchAll();
+
+        $csvHandle = fopen($outputPath, 'w');
+        if ($csvHandle === false) {
+            echo "Unable to write CSV file to: $outputPath\n";
+            exit(1);
+        }
+
+        fputcsv($csvHandle, ['date', 'steps', 'kilometres'], ',', '"', '\\');
+
+        $weekSteps = 0;
+        $weekMeters = 0;
+        $monthSteps = 0;
+        $monthMeters = 0;
+        $yearSteps = 0;
+        $yearMeters = 0;
+        $maxSteps = null;
+        $maxStepsDate = null;
+        $maxMeters = null;
+        $maxMetersDate = null;
+
+        $rowCount = count($rows);
+        for ($i = 0; $i < $rowCount; $i++) {
+            $row = $rows[$i];
+            $dateObj = new DateTime($row['date']);
+            $weekKey = $dateObj->format('o-\\WW');
+            $monthKey = $dateObj->format('Y-m');
+            $yearKey = $dateObj->format('Y');
+
+            $steps = (int)$row['steps'];
+            $meters = (int)$row['meters'];
+            $kilometres = round($meters / 1000, 3);
+
+            if ($maxSteps === null || $steps > $maxSteps) {
+                $maxSteps = $steps;
+                $maxStepsDate = $dateObj->format('Y-m-d');
+            }
+
+            if ($maxMeters === null || $meters > $maxMeters) {
+                $maxMeters = $meters;
+                $maxMetersDate = $dateObj->format('Y-m-d');
+            }
+
+            $weekSteps += $steps;
+            $weekMeters += $meters;
+            $monthSteps += $steps;
+            $monthMeters += $meters;
+            $yearSteps += $steps;
+            $yearMeters += $meters;
+
+            fputcsv($csvHandle, [
+                $row['date'],
+                number_format($steps),
+                $kilometres,
+            ], ',', '"', '\\');
+
+            $nextRow = ($i + 1 < $rowCount) ? $rows[$i + 1] : null;
+            $isLastRow = ($nextRow === null);
+
+            $isWeekEnd = $isLastRow;
+            $isMonthEnd = $isLastRow;
+            $isYearEnd = $isLastRow;
+
+            if (!$isLastRow) {
+                $nextDateObj = new DateTime($nextRow['date']);
+                $nextWeekKey = $nextDateObj->format('o-\\WW');
+                $nextMonthKey = $nextDateObj->format('Y-m');
+                $nextYearKey = $nextDateObj->format('Y');
+
+                $isWeekEnd = ($nextWeekKey !== $weekKey);
+                $isMonthEnd = ($nextMonthKey !== $monthKey);
+                $isYearEnd = ($nextYearKey !== $yearKey);
+            }
+
+            if ($isWeekEnd) {
+                fputcsv($csvHandle, [
+                    'WEEK TOTAL ' . $weekKey,
+                    number_format($weekSteps),
+                    round($weekMeters / 1000, 3),
+                ], ',', '"', '\\');
+                $weekSteps = 0;
+                $weekMeters = 0;
+            }
+
+            if ($isMonthEnd) {
+                fputcsv($csvHandle, [
+                    'MONTH TOTAL ' . $monthKey,
+                    number_format($monthSteps),
+                    round($monthMeters / 1000, 3),
+                ], ',', '"', '\\');
+                $monthSteps = 0;
+                $monthMeters = 0;
+            }
+
+            if ($isYearEnd) {
+                fputcsv($csvHandle, [
+                    'YEAR TOTAL ' . $yearKey,
+                    number_format($yearSteps),
+                    round($yearMeters / 1000, 3),
+                ], ',', '"', '\\');
+                $yearSteps = 0;
+                $yearMeters = 0;
+            }
+        }
+
+        if ($maxSteps !== null) {
+            fputcsv($csvHandle, [
+                'MAX STEPS DATE',
+                $maxStepsDate,
+                number_format($maxSteps),
+            ], ',', '"', '\\');
+        }
+
+        if ($maxMeters !== null) {
+            fputcsv($csvHandle, [
+                'MAX KILOMETRES DATE',
+                $maxMetersDate,
+                round($maxMeters / 1000, 3),
+            ], ',', '"', '\\');
+        }
+
+        fclose($csvHandle);
+        echo "CSV export complete: $outputPath\n";
+    } catch (Exception $e) {
+        echo "Error exporting measurements to CSV: " . $e->getMessage() . "\n";
         exit(1);
     }
-
-    fputcsv($csvHandle, ['date', 'steps', 'miles'], ',', '"', '\\');
-
-    $cursor = clone $start;
-    $totalSteps = 0;
-    $totalDistanceMiles = 0.0;
-    $dayCount = 0;
-    $monthlyTotals = [];
-    $yearlyTotals = [];
-    while ($cursor <= $end) {
-        $currentDate = $cursor->format('Y-m-d');
-        $data = fetchAggregatedFitnessData($config, $currentDate);
-        $totals = extractDailyTotals($data);
-
-        fputcsv($csvHandle, [
-            $currentDate,
-            $totals['steps'],
-            round($totals['distance_miles'], 2),
-        ], ',', '"', '\\');
-
-        $totalSteps += (int)$totals['steps'];
-        $totalDistanceMiles += (float)$totals['distance_miles'];
-        $dayCount++;
-
-        $monthKey = $cursor->format('M Y');
-        if (!isset($monthlyTotals[$monthKey])) {
-            $monthlyTotals[$monthKey] = [
-                'steps' => 0,
-                'miles' => 0.0,
-                'days' => 0,
-            ];
-        }
-        $monthlyTotals[$monthKey]['steps'] += (int)$totals['steps'];
-        $monthlyTotals[$monthKey]['miles'] += (float)$totals['distance_miles'];
-        $monthlyTotals[$monthKey]['days']++;
-
-        $yearKey = $cursor->format('Y');
-        if (!isset($yearlyTotals[$yearKey])) {
-            $yearlyTotals[$yearKey] = [
-                'steps' => 0,
-                'miles' => 0.0,
-                'days' => 0,
-            ];
-        }
-        $yearlyTotals[$yearKey]['steps'] += (int)$totals['steps'];
-        $yearlyTotals[$yearKey]['miles'] += (float)$totals['distance_miles'];
-        $yearlyTotals[$yearKey]['days']++;
-
-        $cursor->modify('+1 day');
-    }
-
-    $avgSteps = $dayCount > 0 ? $totalSteps / $dayCount : 0;
-    $avgMiles = $dayCount > 0 ? $totalDistanceMiles / $dayCount : 0;
-
-    foreach ($monthlyTotals as $month => $monthTotals) {
-        $monthAvgSteps = $monthTotals['days'] > 0 ? $monthTotals['steps'] / $monthTotals['days'] : 0;
-        $monthAvgMiles = $monthTotals['days'] > 0 ? $monthTotals['miles'] / $monthTotals['days'] : 0;
-        fputcsv($csvHandle, [
-            'MONTH TOTAL ' . $month,
-            $monthTotals['steps'],
-            round($monthTotals['miles'], 2),
-        ], ',', '"', '\\');
-        fputcsv($csvHandle, [
-            'MONTH AVERAGE ' . $month,
-            round($monthAvgSteps, 2),
-            round($monthAvgMiles, 2),
-        ], ',', '"', '\\');
-    }
-
-    foreach ($yearlyTotals as $year => $yearTotals) {
-        $yearAvgSteps = $yearTotals['days'] > 0 ? $yearTotals['steps'] / $yearTotals['days'] : 0;
-        $yearAvgMiles = $yearTotals['days'] > 0 ? $yearTotals['miles'] / $yearTotals['days'] : 0;
-        fputcsv($csvHandle, [
-            'YEAR TOTAL ' . $year,
-            $yearTotals['steps'],
-            round($yearTotals['miles'], 2),
-        ], ',', '"', '\\');
-        fputcsv($csvHandle, [
-            'YEAR AVERAGE ' . $year,
-            round($yearAvgSteps, 2),
-            round($yearAvgMiles, 2),
-        ], ',', '"', '\\');
-    }
-
-    fputcsv($csvHandle, [
-        'TOTALS',
-        $totalSteps,
-        round($totalDistanceMiles, 2),
-    ], ',', '"', '\\');
-    fputcsv($csvHandle, [
-        'AVERAGE',
-        round($avgSteps, 2),
-        round($avgMiles, 2),
-    ], ',', '"', '\\');
-
-    fclose($csvHandle);
-    echo "CSV export complete: $outputPath\n";
 }
 
 /**
@@ -636,10 +769,8 @@ function extractDailyTotals($data) {
         }
     }
 
-    $distanceMiles = $distanceMeters * 0.000621371;
-
     return [
         'steps' => $steps,
-        'distance_miles' => $distanceMiles,
+        'distance_meters' => $distanceMeters,
     ];
 }
