@@ -612,13 +612,116 @@ function exportMeasurementsToCsv($config, $outputPath = null) {
             exit(1);
         }
 
-        fputcsv($csvHandle, ['date', 'steps', 'meters'], ',', '"', '\\');
+        fputcsv($csvHandle, ['date', 'steps', 'kilometres'], ',', '"', '\\');
 
-        foreach ($rows as $row) {
+        $weekSteps = 0;
+        $weekMeters = 0;
+        $monthSteps = 0;
+        $monthMeters = 0;
+        $yearSteps = 0;
+        $yearMeters = 0;
+        $maxSteps = null;
+        $maxStepsDate = null;
+        $maxMeters = null;
+        $maxMetersDate = null;
+
+        $rowCount = count($rows);
+        for ($i = 0; $i < $rowCount; $i++) {
+            $row = $rows[$i];
+            $dateObj = new DateTime($row['date']);
+            $weekKey = $dateObj->format('o-\\WW');
+            $monthKey = $dateObj->format('Y-m');
+            $yearKey = $dateObj->format('Y');
+
+            $steps = (int)$row['steps'];
+            $meters = (int)$row['meters'];
+            $kilometres = round($meters / 1000, 3);
+
+            if ($maxSteps === null || $steps > $maxSteps) {
+                $maxSteps = $steps;
+                $maxStepsDate = $dateObj->format('Y-m-d');
+            }
+
+            if ($maxMeters === null || $meters > $maxMeters) {
+                $maxMeters = $meters;
+                $maxMetersDate = $dateObj->format('Y-m-d');
+            }
+
+            $weekSteps += $steps;
+            $weekMeters += $meters;
+            $monthSteps += $steps;
+            $monthMeters += $meters;
+            $yearSteps += $steps;
+            $yearMeters += $meters;
+
             fputcsv($csvHandle, [
                 $row['date'],
-                (int)$row['steps'],
-                (int)$row['meters'],
+                number_format($steps),
+                $kilometres,
+            ], ',', '"', '\\');
+
+            $nextRow = ($i + 1 < $rowCount) ? $rows[$i + 1] : null;
+            $isLastRow = ($nextRow === null);
+
+            $isWeekEnd = $isLastRow;
+            $isMonthEnd = $isLastRow;
+            $isYearEnd = $isLastRow;
+
+            if (!$isLastRow) {
+                $nextDateObj = new DateTime($nextRow['date']);
+                $nextWeekKey = $nextDateObj->format('o-\\WW');
+                $nextMonthKey = $nextDateObj->format('Y-m');
+                $nextYearKey = $nextDateObj->format('Y');
+
+                $isWeekEnd = ($nextWeekKey !== $weekKey);
+                $isMonthEnd = ($nextMonthKey !== $monthKey);
+                $isYearEnd = ($nextYearKey !== $yearKey);
+            }
+
+            if ($isWeekEnd) {
+                fputcsv($csvHandle, [
+                    'WEEK TOTAL ' . $weekKey,
+                    number_format($weekSteps),
+                    round($weekMeters / 1000, 3),
+                ], ',', '"', '\\');
+                $weekSteps = 0;
+                $weekMeters = 0;
+            }
+
+            if ($isMonthEnd) {
+                fputcsv($csvHandle, [
+                    'MONTH TOTAL ' . $monthKey,
+                    number_format($monthSteps),
+                    round($monthMeters / 1000, 3),
+                ], ',', '"', '\\');
+                $monthSteps = 0;
+                $monthMeters = 0;
+            }
+
+            if ($isYearEnd) {
+                fputcsv($csvHandle, [
+                    'YEAR TOTAL ' . $yearKey,
+                    number_format($yearSteps),
+                    round($yearMeters / 1000, 3),
+                ], ',', '"', '\\');
+                $yearSteps = 0;
+                $yearMeters = 0;
+            }
+        }
+
+        if ($maxSteps !== null) {
+            fputcsv($csvHandle, [
+                'MAX STEPS DATE',
+                $maxStepsDate,
+                number_format($maxSteps),
+            ], ',', '"', '\\');
+        }
+
+        if ($maxMeters !== null) {
+            fputcsv($csvHandle, [
+                'MAX KILOMETRES DATE',
+                $maxMetersDate,
+                round($maxMeters / 1000, 3),
             ], ',', '"', '\\');
         }
 
