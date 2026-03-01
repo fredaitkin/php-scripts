@@ -8,6 +8,9 @@ CREATE TABLE IF NOT EXISTS `measurements` (
   `id` INT UNSIGNED NOT NULL AUTO_INCREMENT,
   `date` DATETIME NOT NULL,
   `meters` INT NOT NULL,
+  `walking` INT,
+  `treadmill` INT,
+  `biking` INT,
   `steps` INT,
   PRIMARY KEY (`id`)
 );

@@ -260,6 +260,51 @@ function formatDataTypeLabel($dataType) {
 }
 
 /**
+ * Convert Google activity type IDs to readable labels
+ */
+function formatActivityTypeLabel($activityType) {
+    $activityMap = [
+        1 => 'Biking',
+        4 => 'Walking',
+        7 => 'Walking',
+        8 => 'Walking',
+        58 => 'Treadmill',
+    ];
+
+    if (!is_numeric($activityType)) {
+        return 'Unknown Activity';
+    }
+
+    $activityTypeInt = (int)$activityType;
+    return $activityMap[$activityTypeInt] ?? ('Activity ' . $activityTypeInt);
+}
+
+/**
+ * Resolve bucket date safely with fallback to requested day
+ */
+function resolveBucketDate($bucket, $timezone, $fallbackDate = null) {
+    $startMsRaw = $bucket['startTimeMillis'] ?? null;
+
+    if ($startMsRaw !== null && is_numeric($startMsRaw)) {
+        $startMs = (float)$startMsRaw;
+        if ($startMs > 0) {
+            $timestamp = (int)floor($startMs / 1000);
+            if ($timestamp > 0) {
+                return (new DateTime('@' . $timestamp))
+                    ->setTimezone($timezone)
+                    ->format('Y-m-d');
+            }
+        }
+    }
+
+    if ($fallbackDate !== null && preg_match('/^\d{4}-\d{2}-\d{2}$/', $fallbackDate)) {
+        return $fallbackDate;
+    }
+
+    return (new DateTime('now', $timezone))->format('Y-m-d');
+}
+
+/**
  * Step 3: Load fitness data from Google Fit API
  */
 function load($config, $date = null) {
@@ -289,13 +334,13 @@ function load($config, $date = null) {
         $currentDate = $cursor->format('Y-m-d');
         $data = fetchAggregatedFitnessData($config, $currentDate);
 
-        $measurements = buildMeasurementsFromAggregateData($data, $timezone);
+        $measurements = buildMeasurementsFromAggregateData($data, $timezone, $currentDate);
         if (!empty($measurements)) {
             $allMeasurements = array_merge($allMeasurements, $measurements);
         }
 
         echo "=== Google Fit Data ({$currentDate}) ===\n\n";
-        printLoadOutput($data, $timezone);
+        printLoadOutput($data, $timezone, $currentDate);
         echo "\n";
 
         $cursor->modify('+1 day');
@@ -333,40 +378,71 @@ function startDateHasBeenProcessed($config, $date) {
 /**
  * Print load output for aggregate API data
  */
-function printLoadOutput($data, $timezone) {
+function printLoadOutput($data, $timezone, $fallbackDate = null) {
     if (isset($data['bucket']) && !empty($data['bucket'])) {
+        $dailyActivityTotals = [];
+
         foreach ($data['bucket'] as $bucket) {
-            $bucketStartTimestamp = (int)($bucket['startTimeMillis'] / 1000);
-            $bucketDate = (new DateTime('@' . $bucketStartTimestamp))
-                ->setTimezone($timezone)
-                ->format('Y-m-d');
-            echo "Date: " . $bucketDate . "\n";
+            $bucketDate = resolveBucketDate($bucket, $timezone, $fallbackDate);
+
+            $activityType = isset($bucket['activity']) ? (int)$bucket['activity'] : -1;
+            $activityLabel = formatActivityTypeLabel($activityType);
+
+            if (!isset($dailyActivityTotals[$bucketDate])) {
+                $dailyActivityTotals[$bucketDate] = [];
+            }
+
+            if (!isset($dailyActivityTotals[$bucketDate][$activityLabel])) {
+                $dailyActivityTotals[$bucketDate][$activityLabel] = [
+                    'steps' => 0,
+                    'distance_meters' => 0.0,
+                    'activity_types' => [],
+                ];
+            }
+
+            if ($activityType >= 0) {
+                $dailyActivityTotals[$bucketDate][$activityLabel]['activity_types'][$activityType] = true;
+            }
 
             foreach ($bucket['dataset'] as $dataset) {
                 $dataType = $dataset['dataSourceId'] ?? 'Unknown';
-                $outputLabel = formatDataTypeLabel($dataType);
 
                 if (!empty($dataset['point'])) {
                     foreach ($dataset['point'] as $point) {
                         foreach ($point['value'] as $value) {
+                            $valueNum = null;
                             if (isset($value['intVal'])) {
-                                $intValue = $value['intVal'];
-                                if (strpos($dataType, 'distance.delta') !== false) {
-                                    echo "  " . $outputLabel . ": " . round((float)$intValue) . "\n";
-                                } else {
-                                    echo "  " . $outputLabel . ": " . $intValue . "\n";
-                                }
+                                $valueNum = (float)$value['intVal'];
                             } elseif (isset($value['fpVal'])) {
-                                $fpValue = $value['fpVal'];
-                                if (strpos($dataType, 'distance.delta') !== false) {
-                                    echo "  " . $outputLabel . ": " . round($fpValue) . "\n";
-                                } else {
-                                    echo "  " . $outputLabel . ": " . round($fpValue, 2) . "\n";
+                                $valueNum = (float)$value['fpVal'];
+                            }
+
+                            if ($valueNum !== null) {
+                                if (strpos($dataType, 'step_count.delta') !== false) {
+                                    $dailyActivityTotals[$bucketDate][$activityLabel]['steps'] += (int)$valueNum;
+                                } elseif (strpos($dataType, 'distance.delta') !== false) {
+                                    $dailyActivityTotals[$bucketDate][$activityLabel]['distance_meters'] += $valueNum;
                                 }
                             }
                         }
                     }
                 }
+            }
+        }
+
+        foreach ($dailyActivityTotals as $date => $activityGroups) {
+            echo "Date: " . $date . "\n";
+
+            foreach ($activityGroups as $activityLabel => $totals) {
+                $activityTypeIds = array_keys($totals['activity_types']);
+                sort($activityTypeIds);
+                $activityTypeSuffix = !empty($activityTypeIds)
+                    ? ' (' . implode(',', $activityTypeIds) . ')'
+                    : '';
+
+                echo "  activity_type: " . $activityLabel . $activityTypeSuffix . "\n";
+                echo "    steps: " . (int)$totals['steps'] . "\n";
+                echo "    distance: " . round((float)$totals['distance_meters']) . "\n";
             }
         }
     } else {
@@ -437,22 +513,53 @@ function getDatabaseConnection($config) {
 /**
  * Build measurement rows (date, meters, steps) from aggregate API response
  */
-function buildMeasurementsFromAggregateData($data, $timezone) {
+function buildMeasurementsFromAggregateData($data, $timezone, $fallbackDate = null) {
     $measurements = [];
+    $dailyTotals = [];
 
     if (isset($data['bucket']) && !empty($data['bucket'])) {
         foreach ($data['bucket'] as $bucket) {
-            $bucketStartTimestamp = (int)($bucket['startTimeMillis'] / 1000);
-            $measurementDate = (new DateTime('@' . $bucketStartTimestamp))
+            $dateOnly = resolveBucketDate($bucket, $timezone, $fallbackDate);
+            $activityType = isset($bucket['activity']) ? (int)$bucket['activity'] : -1;
+            $activityLabel = formatActivityTypeLabel($activityType);
+
+            if (!isset($dailyTotals[$dateOnly])) {
+                $dailyTotals[$dateOnly] = [
+                    'steps' => 0,
+                    'distance_meters' => 0.0,
+                    'walking_meters' => 0.0,
+                    'biking_meters' => 0.0,
+                    'treadmill_meters' => 0.0,
+                ];
+            }
+
+            $bucketTotals = extractDailyTotals(['bucket' => [$bucket]]);
+            $dailyTotals[$dateOnly]['steps'] += (int)$bucketTotals['steps'];
+            $dailyTotals[$dateOnly]['distance_meters'] += (float)$bucketTotals['distance_meters'];
+
+            if ($activityLabel === 'Walking') {
+                $dailyTotals[$dateOnly]['walking_meters'] += (float)$bucketTotals['distance_meters'];
+            } elseif ($activityLabel === 'Biking') {
+                $dailyTotals[$dateOnly]['biking_meters'] += (float)$bucketTotals['distance_meters'];
+            } elseif ($activityLabel === 'Treadmill') {
+                $dailyTotals[$dateOnly]['treadmill_meters'] += (float)$bucketTotals['distance_meters'];
+            }
+        }
+
+        ksort($dailyTotals);
+
+        foreach ($dailyTotals as $dateOnly => $totals) {
+            $measurementDate = (new DateTime($dateOnly . ' 00:00:00', $timezone))
                 ->setTimezone($timezone)
                 ->format('Y-m-d 00:00:00');
 
-            $bucketTotals = extractDailyTotals(['bucket' => [$bucket]]);
-
             $measurements[] = [
                 'date' => $measurementDate,
-                'meters' => (int)round($bucketTotals['distance_meters']),
-                'steps' => (int)$bucketTotals['steps'],
+                'meters' => (int)round($totals['distance_meters']),
+                'walking' => (int)round($totals['walking_meters']),
+                'biking' => (int)round($totals['biking_meters']),
+                'treadmill' => (int)round($totals['treadmill_meters']),
+                'steps' => (int)$totals['steps'],
             ];
         }
     }
@@ -471,12 +578,15 @@ function insertMeasurements($config, $measurements) {
     try {
         $pdo = getDatabaseConnection($config);
 
-        $stmt = $pdo->prepare('INSERT INTO measurements (`date`, `meters`, `steps`) VALUES (:date, :meters, :steps)');
+        $stmt = $pdo->prepare('INSERT INTO measurements (`date`, `meters`, `walking`, `biking`, `treadmill`, `steps`) VALUES (:date, :meters, :walking, :biking, :treadmill, :steps)');
 
         foreach ($measurements as $measurement) {
             $stmt->execute([
                 ':date' => $measurement['date'],
                 ':meters' => (int)$measurement['meters'],
+                ':walking' => (int)($measurement['walking'] ?? 0),
+                ':biking' => (int)($measurement['biking'] ?? 0),
+                ':treadmill' => (int)($measurement['treadmill'] ?? 0),
                 ':steps' => (int)$measurement['steps'],
             ]);
         }
@@ -532,8 +642,8 @@ function fetchAggregatedFitnessData($config, $date = null) {
                 // 'dataTypeName' => 'com.google.heart_rate.bpm',
             ],
         ],
-        'bucketByTime' => [
-            'durationMillis' => 86400000,
+        'bucketByActivityType' => [
+            'minDurationMillis' => 60000,
         ],
         'startTimeMillis' => $startMs,
         'endTimeMillis' => $endMs,
@@ -603,7 +713,7 @@ function exportMeasurementsToCsv($config, $outputPath = null) {
 
     try {
         $pdo = getDatabaseConnection($config);
-        $stmt = $pdo->query('SELECT `date`, `steps`, `meters` FROM measurements ORDER BY `date` ASC');
+        $stmt = $pdo->query('SELECT `date`, `steps`, `meters`, `walking`, `biking`, `treadmill` FROM measurements ORDER BY `date` ASC');
         $rows = $stmt->fetchAll();
 
         $csvHandle = fopen($outputPath, 'w');
@@ -612,52 +722,105 @@ function exportMeasurementsToCsv($config, $outputPath = null) {
             exit(1);
         }
 
-        fputcsv($csvHandle, ['date', 'steps', 'kilometres'], ',', '"', '\\');
+        fputcsv($csvHandle, ['date', 'steps', 'kilometres', 'walking_kilometres', 'biking_kilometres', 'treadmill_kilometres'], ',', '"', '\\');
 
         $weekSteps = 0;
         $weekMeters = 0;
+        $weekWalkingMeters = 0;
+        $weekBikingMeters = 0;
+        $weekTreadmillMeters = 0;
         $monthSteps = 0;
         $monthMeters = 0;
+        $monthWalkingMeters = 0;
+        $monthBikingMeters = 0;
+        $monthTreadmillMeters = 0;
         $yearSteps = 0;
         $yearMeters = 0;
+        $yearWalkingMeters = 0;
+        $yearBikingMeters = 0;
+        $yearTreadmillMeters = 0;
         $maxSteps = null;
         $maxStepsDate = null;
-        $maxMeters = null;
-        $maxMetersDate = null;
+        $maxWalkingMeters = null;
+        $maxWalkingDate = null;
+        $maxBikingMeters = null;
+        $maxBikingDate = null;
+        $maxTreadmillMeters = null;
+        $maxTreadmillDate = null;
 
         $rowCount = count($rows);
+        $currentYearHeader = null;
         for ($i = 0; $i < $rowCount; $i++) {
             $row = $rows[$i];
             $dateObj = new DateTime($row['date']);
             $weekKey = $dateObj->format('o-\\WW');
             $monthKey = $dateObj->format('Y-m');
+            $monthDateFromKey = DateTime::createFromFormat('!Y-m', $monthKey);
+            $monthName = $monthDateFromKey ? $monthDateFromKey->format('F') : $monthKey;
             $yearKey = $dateObj->format('Y');
+
+            if ($currentYearHeader !== $yearKey) {
+                fputcsv($csvHandle, [
+                    'YEAR ' . $yearKey,
+                    '',
+                    '',
+                ], ',', '"', '\\');
+                $currentYearHeader = $yearKey;
+            }
 
             $steps = (int)$row['steps'];
             $meters = (int)$row['meters'];
+            $walkingMeters = (int)($row['walking'] ?? 0);
+            $bikingMeters = (int)($row['biking'] ?? 0);
+            $treadmillMeters = (int)($row['treadmill'] ?? 0);
             $kilometres = round($meters / 1000, 3);
+            $walkingKilometres = round($walkingMeters / 1000, 3);
+            $bikingKilometres = round($bikingMeters / 1000, 3);
+            $treadmillKilometres = round($treadmillMeters / 1000, 3);
 
             if ($maxSteps === null || $steps > $maxSteps) {
                 $maxSteps = $steps;
                 $maxStepsDate = $dateObj->format('Y-m-d');
             }
 
-            if ($maxMeters === null || $meters > $maxMeters) {
-                $maxMeters = $meters;
-                $maxMetersDate = $dateObj->format('Y-m-d');
+            if ($maxWalkingMeters === null || $walkingMeters > $maxWalkingMeters) {
+                $maxWalkingMeters = $walkingMeters;
+                $maxWalkingDate = $dateObj->format('Y-m-d');
+            }
+
+            if ($maxBikingMeters === null || $bikingMeters > $maxBikingMeters) {
+                $maxBikingMeters = $bikingMeters;
+                $maxBikingDate = $dateObj->format('Y-m-d');
+            }
+
+            if ($maxTreadmillMeters === null || $treadmillMeters > $maxTreadmillMeters) {
+                $maxTreadmillMeters = $treadmillMeters;
+                $maxTreadmillDate = $dateObj->format('Y-m-d');
             }
 
             $weekSteps += $steps;
             $weekMeters += $meters;
+            $weekWalkingMeters += $walkingMeters;
+            $weekBikingMeters += $bikingMeters;
+            $weekTreadmillMeters += $treadmillMeters;
             $monthSteps += $steps;
             $monthMeters += $meters;
+            $monthWalkingMeters += $walkingMeters;
+            $monthBikingMeters += $bikingMeters;
+            $monthTreadmillMeters += $treadmillMeters;
             $yearSteps += $steps;
             $yearMeters += $meters;
+            $yearWalkingMeters += $walkingMeters;
+            $yearBikingMeters += $bikingMeters;
+            $yearTreadmillMeters += $treadmillMeters;
 
             fputcsv($csvHandle, [
                 $row['date'],
                 number_format($steps),
                 $kilometres,
+                $walkingKilometres,
+                $bikingKilometres,
+                $treadmillKilometres,
             ], ',', '"', '\\');
 
             $nextRow = ($i + 1 < $rowCount) ? $rows[$i + 1] : null;
@@ -680,22 +843,34 @@ function exportMeasurementsToCsv($config, $outputPath = null) {
 
             if ($isWeekEnd) {
                 fputcsv($csvHandle, [
-                    'WEEK TOTAL ' . $weekKey,
+                    'WEEK TOTAL',
                     number_format($weekSteps),
                     round($weekMeters / 1000, 3),
+                    round($weekWalkingMeters / 1000, 3),
+                    round($weekBikingMeters / 1000, 3),
+                    round($weekTreadmillMeters / 1000, 3),
                 ], ',', '"', '\\');
                 $weekSteps = 0;
                 $weekMeters = 0;
+                $weekWalkingMeters = 0;
+                $weekBikingMeters = 0;
+                $weekTreadmillMeters = 0;
             }
 
             if ($isMonthEnd) {
                 fputcsv($csvHandle, [
-                    'MONTH TOTAL ' . $monthKey,
+                    'MONTH TOTAL ' . $monthName,
                     number_format($monthSteps),
                     round($monthMeters / 1000, 3),
+                    round($monthWalkingMeters / 1000, 3),
+                    round($monthBikingMeters / 1000, 3),
+                    round($monthTreadmillMeters / 1000, 3),
                 ], ',', '"', '\\');
                 $monthSteps = 0;
                 $monthMeters = 0;
+                $monthWalkingMeters = 0;
+                $monthBikingMeters = 0;
+                $monthTreadmillMeters = 0;
             }
 
             if ($isYearEnd) {
@@ -703,9 +878,15 @@ function exportMeasurementsToCsv($config, $outputPath = null) {
                     'YEAR TOTAL ' . $yearKey,
                     number_format($yearSteps),
                     round($yearMeters / 1000, 3),
+                    round($yearWalkingMeters / 1000, 3),
+                    round($yearBikingMeters / 1000, 3),
+                    round($yearTreadmillMeters / 1000, 3),
                 ], ',', '"', '\\');
                 $yearSteps = 0;
                 $yearMeters = 0;
+                $yearWalkingMeters = 0;
+                $yearBikingMeters = 0;
+                $yearTreadmillMeters = 0;
             }
         }
 
@@ -714,14 +895,42 @@ function exportMeasurementsToCsv($config, $outputPath = null) {
                 'MAX STEPS DATE',
                 $maxStepsDate,
                 number_format($maxSteps),
+                '',
+                '',
+                '',
             ], ',', '"', '\\');
         }
 
-        if ($maxMeters !== null) {
+        if ($maxWalkingMeters !== null) {
             fputcsv($csvHandle, [
-                'MAX KILOMETRES DATE',
-                $maxMetersDate,
-                round($maxMeters / 1000, 3),
+                'MAX WALKING KILOMETRES DATE',
+                $maxWalkingDate,
+                round($maxWalkingMeters / 1000, 3),
+                '',
+                '',
+                '',
+            ], ',', '"', '\\');
+        }
+
+        if ($maxBikingMeters !== null) {
+            fputcsv($csvHandle, [
+                'MAX BIKING KILOMETRES DATE',
+                $maxBikingDate,
+                round($maxBikingMeters / 1000, 3),
+                '',
+                '',
+                '',
+            ], ',', '"', '\\');
+        }
+
+        if ($maxTreadmillMeters !== null) {
+            fputcsv($csvHandle, [
+                'MAX TREADMILL KILOMETRES DATE',
+                $maxTreadmillDate,
+                round($maxTreadmillMeters / 1000, 3),
+                '',
+                '',
+                '',
             ], ',', '"', '\\');
         }
 
