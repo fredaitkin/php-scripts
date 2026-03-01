@@ -32,6 +32,7 @@ $config = require $configFile;
 if (!isset($argv[1])) {
     echo "Usage:\n";
     echo "  php google_fit_connector.php auth              - Run automated authorization flow\n";
+    echo "  php google_fit_connector.php token-health      - Check token status and refresh health\n";
     echo "  php google_fit_connector.php load [DATE]       - Load fitness data (DATE format: YYYY-MM-DD; if omitted, uses day after latest DB row)\n";
     echo "  php google_fit_connector.php csv [OUTPUT_PATH] - Export measurements table to CSV\n";
     exit(1);
@@ -43,6 +44,8 @@ $date = isset($argv[2]) ? $argv[2] : null;
 
 if ($command === 'auth') {
     handleAuthorization($config);
+} elseif ($command === 'token-health') {
+    printTokenHealth($config);
 } elseif ($command === 'load') {
     ensureValidAccessToken($config);
     load($config, $date);
@@ -56,6 +59,7 @@ if ($command === 'auth') {
     echo "Usage:\n";
     echo "  php google_fit_connector.php auth              - Run automated authorization flow\n";
     echo "  php google_fit_connector.php token CODE        - Exchange code for token\n";
+    echo "  php google_fit_connector.php token-health      - Check token status and refresh health\n";
     echo "  php google_fit_connector.php load [DATE]       - Load fitness data (DATE format: YYYY-MM-DD; if omitted, uses day after latest DB row)\n";
     echo "  php google_fit_connector.php csv [OUTPUT_PATH] - Export measurements table to CSV\n";
     exit(1);
@@ -332,26 +336,20 @@ function exchangeTokenFromCode($config, $authCode) {
 }
 
 /**
- * Refresh the access token using the refresh token
+ * Request refreshed access token from Google OAuth endpoint
  */
-function refreshAccessToken($config, $tokenData) {
-    if (!isset($tokenData['refresh_token'])) {
-        echo "Error: Refresh token not available.\n";
-        exit(1);
-    }
-
+function requestTokenRefreshResponse($config, $refreshToken) {
     $ch = curl_init('https://oauth2.googleapis.com/token');
-    
+
     curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
     curl_setopt($ch, CURLOPT_POST, true);
     curl_setopt($ch, CURLOPT_POSTFIELDS, http_build_query([
         'client_id' => $config['client_id'],
         'client_secret' => $config['client_secret'],
-        'refresh_token' => $tokenData['refresh_token'],
+        'refresh_token' => $refreshToken,
         'grant_type' => 'refresh_token',
     ]));
 
-    // Handle SSL certificate verification
     $caBundle = __DIR__ . '/cacert.pem';
     if (file_exists($caBundle)) {
         curl_setopt($ch, CURLOPT_CAINFO, $caBundle);
@@ -365,15 +363,47 @@ function refreshAccessToken($config, $tokenData) {
     $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
     curl_close($ch);
 
+    $responseData = null;
+    if (is_string($response) && $response !== '') {
+        $decoded = json_decode($response, true);
+        if (is_array($decoded)) {
+            $responseData = $decoded;
+        }
+    }
+
+    return [
+        'success' => (!$curlError && $httpCode === 200 && is_array($responseData)),
+        'http_code' => $httpCode,
+        'curl_error' => $curlError ?: null,
+        'raw_response' => $response,
+        'data' => $responseData,
+        'oauth_error' => $responseData['error'] ?? null,
+        'oauth_error_description' => $responseData['error_description'] ?? null,
+    ];
+}
+
+/**
+ * Refresh the access token using the refresh token
+ */
+function refreshAccessToken($config, $tokenData) {
+    if (!isset($tokenData['refresh_token'])) {
+        echo "Error: Refresh token not available.\n";
+        exit(1);
+    }
+
+    $refreshResult = requestTokenRefreshResponse($config, $tokenData['refresh_token']);
+    $response = $refreshResult['raw_response'];
+    $curlError = $refreshResult['curl_error'];
+    $httpCode = $refreshResult['http_code'];
+
     if ($curlError) {
         echo "cURL Error during token refresh: $curlError\n";
         exit(1);
     }
 
     if ($httpCode !== 200) {
-        $responseData = json_decode($response, true);
-        $oauthError = $responseData['error'] ?? null;
-        $oauthDescription = $responseData['error_description'] ?? null;
+        $oauthError = $refreshResult['oauth_error'];
+        $oauthDescription = $refreshResult['oauth_error_description'];
 
         if ($oauthError === 'invalid_grant') {
             if (file_exists($config['token_file'])) {
@@ -397,7 +427,11 @@ function refreshAccessToken($config, $tokenData) {
         exit(1);
     }
 
-    $newTokenData = json_decode($response, true);
+    $newTokenData = $refreshResult['data'];
+    if (!is_array($newTokenData)) {
+        echo "Error: Invalid token refresh response payload.\n";
+        exit(1);
+    }
     
     // Preserve refresh token if not returned (Google doesn't always return it)
     if (!isset($newTokenData['refresh_token'])) {
@@ -409,6 +443,84 @@ function refreshAccessToken($config, $tokenData) {
 
     // Save updated token
     file_put_contents($config['token_file'], json_encode($newTokenData, JSON_PRETTY_PRINT));
+}
+
+/**
+ * Print token file status and non-mutating refresh health check
+ */
+function printTokenHealth($config) {
+    $tokenFile = $config['token_file'];
+
+    echo "Token file: {$tokenFile}\n";
+    if (!file_exists($tokenFile)) {
+        echo "Status: MISSING\n";
+        exit(1);
+    }
+
+    $tokenRaw = file_get_contents($tokenFile);
+    $tokenData = json_decode($tokenRaw, true);
+    if (!is_array($tokenData)) {
+        echo "Status: INVALID JSON\n";
+        exit(1);
+    }
+
+    $hasAccessToken = isset($tokenData['access_token']) && $tokenData['access_token'] !== '';
+    $hasRefreshToken = isset($tokenData['refresh_token']) && $tokenData['refresh_token'] !== '';
+    $expiresAt = isset($tokenData['expires_at']) ? (int)$tokenData['expires_at'] : 0;
+    $now = time();
+    $secondsRemaining = $expiresAt - $now;
+
+    echo "Access token: " . ($hasAccessToken ? 'PRESENT' : 'MISSING') . "\n";
+    echo "Refresh token: " . ($hasRefreshToken ? 'PRESENT' : 'MISSING') . "\n";
+
+    if ($expiresAt > 0) {
+        $expiryText = date('Y-m-d H:i:s', $expiresAt);
+        echo "Expires at (local): {$expiryText}\n";
+        echo "Seconds remaining: {$secondsRemaining}\n";
+        if ($secondsRemaining <= 0) {
+            echo "Expiry status: EXPIRED\n";
+        } elseif ($secondsRemaining <= 300) {
+            echo "Expiry status: EXPIRING_SOON\n";
+        } else {
+            echo "Expiry status: VALID\n";
+        }
+    } else {
+        echo "Expiry status: UNKNOWN (missing expires_at)\n";
+    }
+
+    if (!$hasRefreshToken) {
+        echo "Refresh health: SKIPPED (no refresh token)\n";
+        exit(1);
+    }
+
+    $refreshResult = requestTokenRefreshResponse($config, $tokenData['refresh_token']);
+    if ($refreshResult['success']) {
+        $nextExpiresIn = $refreshResult['data']['expires_in'] ?? null;
+        echo "Refresh health: OK\n";
+        if ($nextExpiresIn !== null) {
+            echo "Refresh test expires_in: {$nextExpiresIn}\n";
+        }
+        echo "Note: Health check does not write token file.\n";
+        return;
+    }
+
+    if ($refreshResult['curl_error']) {
+        echo "Refresh health: FAILED (cURL error: {$refreshResult['curl_error']})\n";
+        exit(1);
+    }
+
+    if ($refreshResult['oauth_error']) {
+        $description = $refreshResult['oauth_error_description'];
+        if ($description) {
+            echo "Refresh health: FAILED ({$refreshResult['oauth_error']}: {$description})\n";
+        } else {
+            echo "Refresh health: FAILED ({$refreshResult['oauth_error']})\n";
+        }
+    } else {
+        echo "Refresh health: FAILED (HTTP {$refreshResult['http_code']})\n";
+    }
+
+    exit(1);
 }
 
 /**
