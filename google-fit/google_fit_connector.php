@@ -626,12 +626,24 @@ function exportMeasurementsToCsv($config, $outputPath = null) {
         $maxMetersDate = null;
 
         $rowCount = count($rows);
+        $currentYearHeader = null;
         for ($i = 0; $i < $rowCount; $i++) {
             $row = $rows[$i];
             $dateObj = new DateTime($row['date']);
             $weekKey = $dateObj->format('o-\\WW');
             $monthKey = $dateObj->format('Y-m');
+            $monthDateFromKey = DateTime::createFromFormat('!Y-m', $monthKey);
+            $monthName = $monthDateFromKey ? $monthDateFromKey->format('F') : $monthKey;
             $yearKey = $dateObj->format('Y');
+
+            if ($currentYearHeader !== $yearKey) {
+                fputcsv($csvHandle, [
+                    'YEAR ' . $yearKey,
+                    '',
+                    '',
+                ], ',', '"', '\\');
+                $currentYearHeader = $yearKey;
+            }
 
             $steps = (int)$row['steps'];
             $meters = (int)$row['meters'];
@@ -680,7 +692,7 @@ function exportMeasurementsToCsv($config, $outputPath = null) {
 
             if ($isWeekEnd) {
                 fputcsv($csvHandle, [
-                    'WEEK TOTAL ' . $weekKey,
+                    'WEEK TOTAL',
                     number_format($weekSteps),
                     round($weekMeters / 1000, 3),
                 ], ',', '"', '\\');
@@ -690,7 +702,7 @@ function exportMeasurementsToCsv($config, $outputPath = null) {
 
             if ($isMonthEnd) {
                 fputcsv($csvHandle, [
-                    'MONTH TOTAL ' . $monthKey,
+                    'MONTH TOTAL ' . $monthName,
                     number_format($monthSteps),
                     round($monthMeters / 1000, 3),
                 ], ',', '"', '\\');
