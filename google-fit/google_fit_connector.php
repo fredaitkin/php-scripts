@@ -31,7 +31,7 @@ $config = require $configFile;
 
 if (!isset($argv[1])) {
     echo "Usage:\n";
-    echo "  php google_fit_connector.php auth              - Get authorization code\n";
+    echo "  php google_fit_connector.php auth              - Run automated authorization flow\n";
     echo "  php google_fit_connector.php load [DATE]       - Load fitness data (DATE format: YYYY-MM-DD; if omitted, uses day after latest DB row)\n";
     echo "  php google_fit_connector.php csv [OUTPUT_PATH] - Export measurements table to CSV\n";
     exit(1);
@@ -54,7 +54,7 @@ if ($command === 'auth') {
     exchangeTokenFromCode($config, $argv[2]);
 } else {
     echo "Usage:\n";
-    echo "  php google_fit_connector.php auth              - Get authorization code\n";
+    echo "  php google_fit_connector.php auth              - Run automated authorization flow\n";
     echo "  php google_fit_connector.php token CODE        - Exchange code for token\n";
     echo "  php google_fit_connector.php load [DATE]       - Load fitness data (DATE format: YYYY-MM-DD; if omitted, uses day after latest DB row)\n";
     echo "  php google_fit_connector.php csv [OUTPUT_PATH] - Export measurements table to CSV\n";
@@ -68,8 +68,8 @@ if ($command === 'auth') {
 /**
  * Step 1: Generate authorization URL for user to visit
  */
-function handleAuthorization($config) {
-    $authUrl = 'https://accounts.google.com/o/oauth2/v2/auth?' . http_build_query([
+function buildAuthorizationUrl($config) {
+    return 'https://accounts.google.com/o/oauth2/v2/auth?' . http_build_query([
         'client_id' => $config['client_id'],
         'redirect_uri' => $config['redirect_uri'],
         'response_type' => 'code',
@@ -77,11 +77,199 @@ function handleAuthorization($config) {
         'access_type' => 'offline',
         'prompt' => 'consent',
     ]);
+}
+
+/**
+ * Run authorization flow, preferring automated local callback capture
+ */
+function handleAuthorization($config, $attemptAutomation = true) {
+    $authUrl = buildAuthorizationUrl($config);
+
+    if ($attemptAutomation && attemptAutomatedAuthorization($config, $authUrl)) {
+        return;
+    }
 
     echo "Please visit this URL to authorize:\n\n";
     echo $authUrl . "\n\n";
     echo "After authorization, you'll be redirected. Copy the 'code' parameter from the URL.\n";
     echo "Then run: php google_fit_connector.php token YOUR_AUTH_CODE\n";
+}
+
+/**
+ * Attempt end-to-end automated OAuth flow
+ */
+function attemptAutomatedAuthorization($config, $authUrl) {
+    $authCode = captureAuthorizationCodeFromLocalCallback($config['redirect_uri'], $authUrl);
+
+    if ($authCode === null) {
+        return false;
+    }
+
+    echo "Authorization code captured. Exchanging token...\n";
+    exchangeTokenFromCode($config, $authCode);
+    return true;
+}
+
+/**
+ * Open URL in default browser
+ */
+function openUrlInDefaultBrowser($url) {
+    $family = PHP_OS_FAMILY;
+
+    if ($family === 'Windows') {
+        $command = 'cmd /c start "" "' . str_replace('"', '\\"', $url) . '"';
+    } elseif ($family === 'Darwin') {
+        $command = 'open ' . escapeshellarg($url);
+    } else {
+        $command = 'xdg-open ' . escapeshellarg($url);
+    }
+
+    @exec($command, $output, $exitCode);
+    return $exitCode === 0;
+}
+
+/**
+ * Send minimal HTTP response to browser
+ */
+function writeOAuthBrowserResponse($connection, $statusCode, $body) {
+    $statusText = $statusCode === 200 ? 'OK' : 'Bad Request';
+    $response = "HTTP/1.1 {$statusCode} {$statusText}\r\n";
+    $response .= "Content-Type: text/html; charset=UTF-8\r\n";
+    $response .= "Content-Length: " . strlen($body) . "\r\n";
+    $response .= "Connection: close\r\n\r\n";
+    $response .= $body;
+    fwrite($connection, $response);
+}
+
+/**
+ * Listen on redirect URI and capture OAuth code automatically
+ */
+function captureAuthorizationCodeFromLocalCallback($redirectUri, $authUrl, $timeoutSeconds = 180) {
+    if (php_sapi_name() !== 'cli') {
+        return null;
+    }
+
+    $parsed = parse_url($redirectUri);
+    if ($parsed === false || !isset($parsed['scheme']) || !isset($parsed['host'])) {
+        return null;
+    }
+
+    $scheme = strtolower($parsed['scheme']);
+    $host = $parsed['host'];
+    $port = isset($parsed['port']) ? (int)$parsed['port'] : 80;
+    $path = $parsed['path'] ?? '/';
+
+    if ($scheme !== 'http') {
+        echo "Automated authorization requires an http redirect_uri. Current: {$redirectUri}\n";
+        return null;
+    }
+
+    if ($host !== 'localhost' && $host !== '127.0.0.1') {
+        echo "Automated authorization requires redirect_uri host localhost or 127.0.0.1. Current: {$host}\n";
+        return null;
+    }
+
+    $server = @stream_socket_server("tcp://{$host}:{$port}", $errno, $errstr);
+    if ($server === false) {
+        echo "Unable to start local callback listener on {$host}:{$port} ({$errstr}).\n";
+        return null;
+    }
+
+    stream_set_blocking($server, false);
+
+    echo "Listening for OAuth callback on {$host}:{$port}{$path}...\n";
+    if (openUrlInDefaultBrowser($authUrl)) {
+        echo "Opened browser for Google authorization.\n";
+    } else {
+        echo "Could not open browser automatically. Open this URL manually:\n{$authUrl}\n";
+    }
+
+    $deadline = time() + $timeoutSeconds;
+    $authCode = null;
+    $oauthError = null;
+    $oauthDescription = null;
+
+    while (time() < $deadline) {
+        $read = [$server];
+        $write = null;
+        $except = null;
+        $remaining = $deadline - time();
+
+        $ready = @stream_select($read, $write, $except, $remaining, 0);
+        if ($ready === false) {
+            break;
+        }
+
+        if ($ready === 0) {
+            continue;
+        }
+
+        $connection = @stream_socket_accept($server, 1);
+        if ($connection === false) {
+            continue;
+        }
+
+        $requestLine = fgets($connection);
+        if ($requestLine === false) {
+            fclose($connection);
+            continue;
+        }
+
+        while (($headerLine = fgets($connection)) !== false) {
+            if (rtrim($headerLine) === '') {
+                break;
+            }
+        }
+
+        $requestTarget = '';
+        if (preg_match('#^[A-Z]+\s+([^\s]+)\s+HTTP/#', trim($requestLine), $matches)) {
+            $requestTarget = $matches[1];
+        }
+
+        $requestParts = parse_url($requestTarget);
+        $requestPath = $requestParts['path'] ?? '/';
+        $query = [];
+        parse_str($requestParts['query'] ?? '', $query);
+
+        if ($requestPath !== $path) {
+            writeOAuthBrowserResponse($connection, 400, '<h2>Invalid callback path.</h2>');
+            fclose($connection);
+            continue;
+        }
+
+        if (isset($query['error'])) {
+            $oauthError = $query['error'];
+            $oauthDescription = $query['error_description'] ?? null;
+            writeOAuthBrowserResponse($connection, 400, '<h2>Authorization failed.</h2><p>You can close this tab.</p>');
+            fclose($connection);
+            break;
+        }
+
+        if (isset($query['code']) && $query['code'] !== '') {
+            $authCode = $query['code'];
+            writeOAuthBrowserResponse($connection, 200, '<h2>Authorization successful.</h2><p>You can close this tab.</p>');
+            fclose($connection);
+            break;
+        }
+
+        writeOAuthBrowserResponse($connection, 400, '<h2>Authorization code was not provided.</h2>');
+        fclose($connection);
+    }
+
+    fclose($server);
+
+    if ($oauthError !== null) {
+        $description = $oauthDescription ? " ({$oauthDescription})" : '';
+        echo "Authorization failed: {$oauthError}{$description}\n";
+        return null;
+    }
+
+    if ($authCode === null) {
+        echo "Timed out waiting for OAuth callback after {$timeoutSeconds} seconds.\n";
+        return null;
+    }
+
+    return $authCode;
 }
 
 /**
@@ -183,6 +371,27 @@ function refreshAccessToken($config, $tokenData) {
     }
 
     if ($httpCode !== 200) {
+        $responseData = json_decode($response, true);
+        $oauthError = $responseData['error'] ?? null;
+        $oauthDescription = $responseData['error_description'] ?? null;
+
+        if ($oauthError === 'invalid_grant') {
+            if (file_exists($config['token_file'])) {
+                @unlink($config['token_file']);
+            }
+
+            echo "Error: Refresh token is no longer valid ({$oauthDescription}).\n";
+            echo "Starting re-authorization flow automatically...\n\n";
+
+            if (attemptAutomatedAuthorization($config, buildAuthorizationUrl($config))) {
+                echo "Re-authorization complete. Continuing with the original request.\n";
+                return;
+            }
+
+            handleAuthorization($config, false);
+            exit(1);
+        }
+
         echo "Error refreshing token (HTTP $httpCode):\n";
         echo "Response: " . $response . "\n";
         exit(1);
@@ -217,6 +426,12 @@ function ensureValidAccessToken($config) {
     }
 
     $tokenData = json_decode(file_get_contents($config['token_file']), true);
+
+    if (!is_array($tokenData)) {
+        echo "Error: Token file is invalid JSON: " . $config['token_file'] . "\n";
+        echo "Please re-authorize: php google_fit_connector.php auth\n";
+        exit(1);
+    }
 
     if (!isset($tokenData['refresh_token'])) {
         echo "Error: Refresh token not found in token file.\n";
