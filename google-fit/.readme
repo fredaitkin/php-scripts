@@ -69,7 +69,7 @@ Copy google_fit_config.example.php to google_fit_config.php and set Client ID an
 The callback server listens on `localhost:8000` to capture the authorization code:
 
 ```bash
-php -S localhost:8000 tools/google_fit_callback.php
+php -S localhost:8000 google_fit_callback.php
 ```
 
 Leave this running in a terminal window.
@@ -78,7 +78,7 @@ Leave this running in a terminal window.
 In a separate terminal:
 
 ```bash
-php tools/google_fit_connector.php auth
+php google_fit_connector.php auth
 ```
 
 This outputs an authorization URL. Copy it and visit it in your browser.
@@ -94,12 +94,12 @@ This outputs an authorization URL. Copy it and visit it in your browser.
 Copy the authorization code and run:
 
 ```bash
-php tools/google_fit_connector.php token YOUR_AUTH_CODE
+php google_fit_connector.php token YOUR_AUTH_CODE
 ```
 
 Example:
 ```bash
-php tools/google_fit_connector.php token 4/0AY0e-g6xZ...
+php google_fit_connector.php token 4/0AY0e-g6xZ...
 ```
 
 The script will:
@@ -113,16 +113,16 @@ Once you have a valid token, retrieve your fitness data:
 
 ```bash
 # Fetch today's data
-php tools/google_fit_connector.php data
+php google_fit_connector.php data
 
 # Fetch data for a specific date
-php tools/google_fit_connector.php data 2026-02-08
+php google_fit_connector.php data 2026-02-08
 
 # Auto-refresh token (if needed) and fetch today's data
-php tools/google_fit_connector.php auto
+php google_fit_connector.php auto
 
 # Auto-refresh token (if needed) and fetch data for a specific date
-php tools/google_fit_connector.php auto 2026-02-08
+php google_fit_connector.php auto 2026-02-08
 ```
 
 ### Output Example

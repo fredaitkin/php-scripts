@@ -37,7 +37,7 @@ if (isset($_GET['code'])) {
         <h1 class="success">✓ Authorization Successful!</h1>
         <p>Copy the code below and run:</p>
         <div class="code"><?php echo htmlspecialchars($authCode); ?></div>
-        <p><code>php tools/google_fit_connector.php token <?php echo htmlspecialchars($authCode); ?></code></p>
+        <p><code>php google_fit_connector.php token <?php echo htmlspecialchars($authCode); ?></code></p>
     </body>
     </html>
     <?php
@@ -82,7 +82,7 @@ if (isset($_GET['error'])) {
     <div class="info">
         <p>This server is listening on <code>localhost:8000</code></p>
         <p>Run the auth command:</p>
-        <pre>php tools/google_fit_connector.php auth</pre>
+        <pre>php google_fit_connector.php auth</pre>
         <p>Then visit the URL shown and authorize your app.</p>
         <p>You will be redirected here with your authorization code.</p>
     </div>

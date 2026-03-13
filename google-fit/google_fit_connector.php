@@ -185,6 +185,8 @@ function refreshAccessToken($config, $tokenData) {
     if ($httpCode !== 200) {
         echo "Error refreshing token (HTTP $httpCode):\n";
         echo "Response: " . $response . "\n";
+        echo "Start the callback server: php -S localhost:8000 google_fit_callback.php\n";
+        echo "Then re-run the auth command and authorize again to get a new token.\n";
         exit(1);
     }
 
