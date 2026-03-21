@@ -30,18 +30,18 @@ $config = require $configFile;
 // ============================================================================
 
 if (!isset($argv[1])) {
-    echo "Usage:\n";
-    echo "  php google_fit_connector.php auth              - Get authorization code\n";
-    echo "  php google_fit_connector.php load [DATE]       - Load fitness data (DATE format: YYYY-MM-DD; if omitted, uses day after latest DB row)\n";
-    echo "  php google_fit_connector.php csv [OUTPUT_PATH] - Export measurements table to CSV\n";
+    printHelp();
     exit(1);
 }
 
-$command = $argv[1];
+$command = strtolower($argv[1]);
 $defaultTimezone = resolveConfiguredTimezone($config);
 $date = isset($argv[2]) ? $argv[2] : null;
 
-if ($command === 'auth') {
+if ($command === 'help' || $command === '-h' || $command === '--help') {
+    printHelp();
+    exit(0);
+} elseif ($command === 'auth') {
     handleAuthorization($config);
 } elseif ($command === 'load') {
     ensureValidAccessToken($config);
@@ -53,17 +53,37 @@ if ($command === 'auth') {
 } elseif ($command === 'token' && isset($argv[2])) {
     exchangeTokenFromCode($config, $argv[2]);
 } else {
-    echo "Usage:\n";
-    echo "  php google_fit_connector.php auth              - Get authorization code\n";
-    echo "  php google_fit_connector.php token CODE        - Exchange code for token\n";
-    echo "  php google_fit_connector.php load [DATE]       - Load fitness data (DATE format: YYYY-MM-DD; if omitted, uses day after latest DB row)\n";
-    echo "  php google_fit_connector.php csv [OUTPUT_PATH] - Export measurements table to CSV\n";
+    printHelp();
     exit(1);
 }
 
 // ============================================================================
 // FUNCTIONS
 // ============================================================================
+
+/**
+ * Print command help and first-time setup flow
+ */
+function printHelp() {
+    echo "Google Fit connector help\n\n";
+    echo "Commands:\n";
+    echo "  php google_fit_connector.php help              - Show this help\n";
+    echo "  php google_fit_connector.php auth              - Print the authorization URL\n";
+    echo "  php google_fit_connector.php token CODE        - Exchange authorization code for token\n";
+    echo "  php google_fit_connector.php load [DATE]       - Load fitness data (DATE format: YYYY-MM-DD; if omitted, uses day after latest DB row)\n";
+    echo "  php google_fit_connector.php csv [OUTPUT_PATH] - Export measurements table to CSV\n\n";
+
+    echo "Expired token authorization flow:\n";
+    echo "  1. Start the callback script in a terminal:\n";
+    echo "     php -S localhost:8000 google_fit_callback.php\n";
+    echo "  2. Run the auth step:\n";
+    echo "     php google_fit_connector.php auth\n";
+    echo "  3. Copy and run the authorization URL manually in your browser.\n";
+    echo "  4. After you authorize, the callback page provides the commands for retrieving the token:\n";
+    echo "     php google_fit_connector.php token YOUR_AUTH_CODE\n";
+    echo "  5. Run the load step:\n";
+    echo "     php google_fit_connector.php load\n";
+}
 
 /**
  * Step 1: Generate authorization URL for user to visit
