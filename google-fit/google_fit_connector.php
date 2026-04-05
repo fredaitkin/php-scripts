@@ -65,6 +65,10 @@ if ($command === 'help' || $command === '-h' || $command === '--help') {
  * Print command help and first-time setup flow
  */
 function printHelp() {
+    $projectDir = __DIR__;
+    $callbackScript = escapeshellarg($projectDir . DIRECTORY_SEPARATOR . 'google_fit_callback.php');
+    $callbackDocRoot = escapeshellarg($projectDir);
+
     echo "Google Fit connector help\n\n";
     echo "Commands:\n";
     echo "  php google_fit_connector.php help              - Show this help\n";
@@ -75,7 +79,7 @@ function printHelp() {
 
     echo "Expired token authorization flow:\n";
     echo "  1. Start the callback script in a terminal:\n";
-    echo "     php -S localhost:8000 google_fit_callback.php\n";
+    echo "     php -S localhost:8000 -t $callbackDocRoot $callbackScript\n";
     echo "  2. Run the auth step:\n";
     echo "     php google_fit_connector.php auth\n";
     echo "  3. Copy and run the authorization URL manually in your browser.\n";
@@ -89,6 +93,10 @@ function printHelp() {
  * Step 1: Generate authorization URL for user to visit
  */
 function handleAuthorization($config) {
+    $projectDir = __DIR__;
+    $callbackScript = escapeshellarg($projectDir . DIRECTORY_SEPARATOR . 'google_fit_callback.php');
+    $callbackDocRoot = escapeshellarg($projectDir);
+
     $authUrl = 'https://accounts.google.com/o/oauth2/v2/auth?' . http_build_query([
         'client_id' => $config['client_id'],
         'redirect_uri' => $config['redirect_uri'],
@@ -97,6 +105,9 @@ function handleAuthorization($config) {
         'access_type' => 'offline',
         'prompt' => 'consent',
     ]);
+
+    echo "Start callback server first (required for redirect_uri {$config['redirect_uri']}):\n";
+    echo "php -S localhost:8000 -t $callbackDocRoot $callbackScript\n\n";
 
     echo "Please visit this URL to authorize:\n\n";
     echo $authUrl . "\n\n";
@@ -205,7 +216,9 @@ function refreshAccessToken($config, $tokenData) {
     if ($httpCode !== 200) {
         echo "Error refreshing token (HTTP $httpCode):\n";
         echo "Response: " . $response . "\n";
-        echo "Start the callback server: php -S localhost:8000 google_fit_callback.php\n";
+        $callbackScript = escapeshellarg(__DIR__ . DIRECTORY_SEPARATOR . 'google_fit_callback.php');
+        $callbackDocRoot = escapeshellarg(__DIR__);
+        echo "Start the callback server: php -S localhost:8000 -t $callbackDocRoot $callbackScript\n";
         echo "Then re-run the auth command and authorize again to get a new token.\n";
         exit(1);
     }
