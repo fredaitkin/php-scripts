@@ -9,6 +9,7 @@
  * 1. Set your credentials in the config section below
  * 2. Run: php google_fit_connector.php auth    (to get authorization)
  * 3. Run: php google_fit_connector.php load    (to fetch fitness data)
+ * 4. Run: php google_fit_connector.php daily   (to print previous-day measurements from DB)
  */
 
 // ============================================================================
@@ -46,6 +47,8 @@ if ($command === 'help' || $command === '-h' || $command === '--help') {
 } elseif ($command === 'load') {
     ensureValidAccessToken($config);
     load($config, $date);
+} elseif ($command === 'daily') {
+    daily($config, $date);
 } elseif ($command === 'csv') {
     ensureValidAccessToken($config);
     $outputPath = isset($argv[2]) ? $argv[2] : null;
@@ -65,17 +68,22 @@ if ($command === 'help' || $command === '-h' || $command === '--help') {
  * Print command help and first-time setup flow
  */
 function printHelp() {
+    $projectDir = __DIR__;
+    $callbackScript = escapeshellarg($projectDir . DIRECTORY_SEPARATOR . 'google_fit_callback.php');
+    $callbackDocRoot = escapeshellarg($projectDir);
+
     echo "Google Fit connector help\n\n";
     echo "Commands:\n";
     echo "  php google_fit_connector.php help              - Show this help\n";
     echo "  php google_fit_connector.php auth              - Print the authorization URL\n";
     echo "  php google_fit_connector.php token CODE        - Exchange authorization code for token\n";
     echo "  php google_fit_connector.php load [DATE]       - Load fitness data (DATE format: YYYY-MM-DD; if omitted, uses day after latest DB row)\n";
+    echo "  php google_fit_connector.php daily [DATE]      - Print measurements from DB for previous day (or DATE: YYYY-MM-DD)\n";
     echo "  php google_fit_connector.php csv [OUTPUT_PATH] - Export measurements table to CSV\n\n";
 
     echo "Expired token authorization flow:\n";
     echo "  1. Start the callback script in a terminal:\n";
-    echo "     php -S localhost:8000 google_fit_callback.php\n";
+    echo "     php -S localhost:8000 -t $callbackDocRoot $callbackScript\n";
     echo "  2. Run the auth step:\n";
     echo "     php google_fit_connector.php auth\n";
     echo "  3. Copy and run the authorization URL manually in your browser.\n";
@@ -83,12 +91,18 @@ function printHelp() {
     echo "     php google_fit_connector.php token YOUR_AUTH_CODE\n";
     echo "  5. Run the load step:\n";
     echo "     php google_fit_connector.php load\n";
+    echo "  6. Run the daily reporting step:\n";
+    echo "     php google_fit_connector.php daily\n";
 }
 
 /**
  * Step 1: Generate authorization URL for user to visit
  */
 function handleAuthorization($config) {
+    $projectDir = __DIR__;
+    $callbackScript = escapeshellarg($projectDir . DIRECTORY_SEPARATOR . 'google_fit_callback.php');
+    $callbackDocRoot = escapeshellarg($projectDir);
+
     $authUrl = 'https://accounts.google.com/o/oauth2/v2/auth?' . http_build_query([
         'client_id' => $config['client_id'],
         'redirect_uri' => $config['redirect_uri'],
@@ -97,6 +111,9 @@ function handleAuthorization($config) {
         'access_type' => 'offline',
         'prompt' => 'consent',
     ]);
+
+    echo "Start callback server first (required for redirect_uri {$config['redirect_uri']}):\n";
+    echo "php -S localhost:8000 -t $callbackDocRoot $callbackScript\n\n";
 
     echo "Please visit this URL to authorize:\n\n";
     echo $authUrl . "\n\n";
@@ -205,7 +222,9 @@ function refreshAccessToken($config, $tokenData) {
     if ($httpCode !== 200) {
         echo "Error refreshing token (HTTP $httpCode):\n";
         echo "Response: " . $response . "\n";
-        echo "Start the callback server: php -S localhost:8000 google_fit_callback.php\n";
+        $callbackScript = escapeshellarg(__DIR__ . DIRECTORY_SEPARATOR . 'google_fit_callback.php');
+        $callbackDocRoot = escapeshellarg(__DIR__);
+        echo "Start the callback server: php -S localhost:8000 -t $callbackDocRoot $callbackScript\n";
         echo "Then re-run the auth command and authorize again to get a new token.\n";
         exit(1);
     }
@@ -369,6 +388,52 @@ function load($config, $date = null) {
     }
 
     insertMeasurements($config, $allMeasurements);
+}
+
+/**
+ * Daily process entry point: print previous-day measurements from DB
+ */
+function daily($config, $date = null) {
+    $timezone = resolveConfiguredTimezone($config);
+
+    if ($date === null || trim($date) === '') {
+        $date = (new DateTime('yesterday', $timezone))->format('Y-m-d');
+    }
+
+    if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $date)) {
+        echo "Invalid date format for daily command. Use YYYY-MM-DD\n";
+        exit(1);
+    }
+
+    try {
+        $pdo = getDatabaseConnection($config);
+        $stmt = $pdo->prepare('SELECT `date`, `steps`, `meters`, `walking`, `biking`, `treadmill` FROM measurements WHERE DATE(`date`) = :target_date ORDER BY `date` ASC');
+        $stmt->execute([':target_date' => $date]);
+        $rows = $stmt->fetchAll();
+
+        if (empty($rows)) {
+            echo "No measurements found for {$date}.\n";
+            return;
+        }
+
+        echo "Daily measurements for {$date}:\n";
+        echo "\n";
+        $steps = (int)($rows[0]['steps'] ?? 0);
+        $meters = (int)($rows[0]['meters'] ?? 0);
+        $walking = (int)($rows[0]['walking'] ?? 0);
+        $biking = (int)($rows[0]['biking'] ?? 0);
+        $treadmill = (int)($rows[0]['treadmill'] ?? 0);
+
+        echo "  steps: " . number_format($steps) . "\n";
+        echo "  kilometres: " . round($meters / 1000, 1) . "\n";
+        echo "  walking_kilometres: " . round($walking / 1000, 1) . "\n";
+        echo "  biking_kilometres: " . round($biking / 1000, 1) . "\n";
+        echo "  treadmill_kilometres: " . round($treadmill / 1000, 1) . "\n";
+
+    } catch (Exception $e) {
+        echo "Error retrieving daily measurements: " . $e->getMessage() . "\n";
+        exit(1);
+    }
 }
 
 /**
