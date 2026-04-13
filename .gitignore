@@ -3,3 +3,4 @@ google-fit/google_fit*config.ps1
 google-fit/google_fit_token.json
 google-fit/*.csv
 google-fit/*.log
+google-fit/register*.ps1

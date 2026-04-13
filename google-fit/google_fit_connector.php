@@ -9,6 +9,7 @@
  * 1. Set your credentials in the config section below
  * 2. Run: php google_fit_connector.php auth    (to get authorization)
  * 3. Run: php google_fit_connector.php load    (to fetch fitness data)
+ * 4. Run: php google_fit_connector.php daily   (to print previous-day measurements from DB)
  */
 
 // ============================================================================
@@ -46,6 +47,8 @@ if ($command === 'help' || $command === '-h' || $command === '--help') {
 } elseif ($command === 'load') {
     ensureValidAccessToken($config);
     load($config, $date);
+} elseif ($command === 'daily') {
+    daily($config, $date);
 } elseif ($command === 'csv') {
     ensureValidAccessToken($config);
     $outputPath = isset($argv[2]) ? $argv[2] : null;
@@ -75,6 +78,7 @@ function printHelp() {
     echo "  php google_fit_connector.php auth              - Print the authorization URL\n";
     echo "  php google_fit_connector.php token CODE        - Exchange authorization code for token\n";
     echo "  php google_fit_connector.php load [DATE]       - Load fitness data (DATE format: YYYY-MM-DD; if omitted, uses day after latest DB row)\n";
+    echo "  php google_fit_connector.php daily [DATE]      - Print measurements from DB for previous day (or DATE: YYYY-MM-DD)\n";
     echo "  php google_fit_connector.php csv [OUTPUT_PATH] - Export measurements table to CSV\n\n";
 
     echo "Expired token authorization flow:\n";
@@ -87,6 +91,8 @@ function printHelp() {
     echo "     php google_fit_connector.php token YOUR_AUTH_CODE\n";
     echo "  5. Run the load step:\n";
     echo "     php google_fit_connector.php load\n";
+    echo "  6. Run the daily reporting step:\n";
+    echo "     php google_fit_connector.php daily\n";
 }
 
 /**
@@ -382,6 +388,52 @@ function load($config, $date = null) {
     }
 
     insertMeasurements($config, $allMeasurements);
+}
+
+/**
+ * Daily process entry point: print previous-day measurements from DB
+ */
+function daily($config, $date = null) {
+    $timezone = resolveConfiguredTimezone($config);
+
+    if ($date === null || trim($date) === '') {
+        $date = (new DateTime('yesterday', $timezone))->format('Y-m-d');
+    }
+
+    if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $date)) {
+        echo "Invalid date format for daily command. Use YYYY-MM-DD\n";
+        exit(1);
+    }
+
+    try {
+        $pdo = getDatabaseConnection($config);
+        $stmt = $pdo->prepare('SELECT `date`, `steps`, `meters`, `walking`, `biking`, `treadmill` FROM measurements WHERE DATE(`date`) = :target_date ORDER BY `date` ASC');
+        $stmt->execute([':target_date' => $date]);
+        $rows = $stmt->fetchAll();
+
+        if (empty($rows)) {
+            echo "No measurements found for {$date}.\n";
+            return;
+        }
+
+        echo "Daily measurements for {$date}:\n";
+        echo "\n";
+        $steps = (int)($rows[0]['steps'] ?? 0);
+        $meters = (int)($rows[0]['meters'] ?? 0);
+        $walking = (int)($rows[0]['walking'] ?? 0);
+        $biking = (int)($rows[0]['biking'] ?? 0);
+        $treadmill = (int)($rows[0]['treadmill'] ?? 0);
+
+        echo "  steps: " . number_format($steps) . "\n";
+        echo "  kilometres: " . round($meters / 1000, 1) . "\n";
+        echo "  walking_kilometres: " . round($walking / 1000, 1) . "\n";
+        echo "  biking_kilometres: " . round($biking / 1000, 1) . "\n";
+        echo "  treadmill_kilometres: " . round($treadmill / 1000, 1) . "\n";
+
+    } catch (Exception $e) {
+        echo "Error retrieving daily measurements: " . $e->getMessage() . "\n";
+        exit(1);
+    }
 }
 
 /**
