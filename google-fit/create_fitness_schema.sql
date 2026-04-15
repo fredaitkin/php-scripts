@@ -10,6 +10,8 @@ CREATE TABLE IF NOT EXISTS `measurements` (
   `meters` INT NOT NULL,
   `walking` INT,
   `treadmill` INT,
+  `treadmill_duration_minutes` DECIMAL(8,2),
+  `treadmill_avg_speed_kmh` DECIMAL(6,2),
   `biking` INT,
   `steps` INT,
   PRIMARY KEY (`id`)

@@ -309,6 +309,8 @@ function formatActivityTypeLabel($activityType) {
         4 => 'Walking',
         7 => 'Walking',
         8 => 'Walking',
+        56 => 'Treadmill',
+        57 => 'Treadmill',
         58 => 'Treadmill',
     ];
 
@@ -318,6 +320,17 @@ function formatActivityTypeLabel($activityType) {
 
     $activityTypeInt = (int)$activityType;
     return $activityMap[$activityTypeInt] ?? ('Activity ' . $activityTypeInt);
+}
+
+/**
+ * Determine whether an activity type represents treadmill activity
+ */
+function isTreadmillActivityType($activityType) {
+    if (!is_numeric($activityType)) {
+        return false;
+    }
+
+    return in_array((int)$activityType, [56, 57, 58], true);
 }
 
 /**
@@ -407,7 +420,7 @@ function daily($config, $date = null) {
 
     try {
         $pdo = getDatabaseConnection($config);
-        $stmt = $pdo->prepare('SELECT `date`, `steps`, `meters`, `walking`, `biking`, `treadmill` FROM measurements WHERE DATE(`date`) = :target_date ORDER BY `date` ASC');
+        $stmt = $pdo->prepare('SELECT `date`, `steps`, `meters`, `walking`, `biking`, `treadmill`, `treadmill_duration_minutes`, `treadmill_avg_speed_kmh` FROM measurements WHERE DATE(`date`) = :target_date ORDER BY `date` ASC');
         $stmt->execute([':target_date' => $date]);
         $rows = $stmt->fetchAll();
 
@@ -423,12 +436,16 @@ function daily($config, $date = null) {
         $walking = (int)($rows[0]['walking'] ?? 0);
         $biking = (int)($rows[0]['biking'] ?? 0);
         $treadmill = (int)($rows[0]['treadmill'] ?? 0);
+        $treadmillDurationMinutes = (float)($rows[0]['treadmill_duration_minutes'] ?? 0);
+        $treadmillAvgSpeedKmh = (float)($rows[0]['treadmill_avg_speed_kmh'] ?? 0);
 
         echo "  steps: " . number_format($steps) . "\n";
         echo "  kilometres: " . round($meters / 1000, 1) . "\n";
         echo "  walking_kilometres: " . round($walking / 1000, 1) . "\n";
         echo "  biking_kilometres: " . round($biking / 1000, 1) . "\n";
         echo "  treadmill_kilometres: " . round($treadmill / 1000, 1) . "\n";
+        echo "  treadmill_duration_minutes: " . round($treadmillDurationMinutes, 1) . "\n";
+        echo "  treadmill_avg_speed_kmh: " . round($treadmillAvgSpeedKmh, 2) . "\n";
 
     } catch (Exception $e) {
         echo "Error retrieving daily measurements: " . $e->getMessage() . "\n";
@@ -483,6 +500,8 @@ function printLoadOutput($data, $timezone, $fallbackDate = null) {
                 $dailyActivityTotals[$bucketDate][$activityLabel] = [
                     'steps' => 0,
                     'distance_meters' => 0.0,
+                    'treadmill_duration_minutes' => 0.0,
+                    'treadmill_avg_speed_kmh' => 0.0,
                     'activity_types' => [],
                 ];
             }
@@ -515,6 +534,17 @@ function printLoadOutput($data, $timezone, $fallbackDate = null) {
                     }
                 }
             }
+
+            if (isTreadmillActivityType($activityType)) {
+                $dailyActivityTotals[$bucketDate][$activityLabel]['treadmill_duration_minutes'] += extractBucketDurationMinutes($bucket);
+                $durationMinutes = (float)$dailyActivityTotals[$bucketDate][$activityLabel]['treadmill_duration_minutes'];
+                if ($durationMinutes > 0) {
+                    $distanceMeters = (float)$dailyActivityTotals[$bucketDate][$activityLabel]['distance_meters'];
+                    $distanceKm = $distanceMeters / 1000;
+                    $durationHours = $durationMinutes / 60;
+                    $dailyActivityTotals[$bucketDate][$activityLabel]['treadmill_avg_speed_kmh'] = round($distanceKm / $durationHours, 2);
+                }
+            }
         }
 
         foreach ($dailyActivityTotals as $date => $activityGroups) {
@@ -526,10 +556,22 @@ function printLoadOutput($data, $timezone, $fallbackDate = null) {
                 $activityTypeSuffix = !empty($activityTypeIds)
                     ? ' (' . implode(',', $activityTypeIds) . ')'
                     : '';
+                $hasTreadmillType = false;
+                foreach ($activityTypeIds as $activityTypeId) {
+                    if (isTreadmillActivityType($activityTypeId)) {
+                        $hasTreadmillType = true;
+                        break;
+                    }
+                }
 
                 echo "  activity_type: " . $activityLabel . $activityTypeSuffix . "\n";
                 echo "    steps: " . (int)$totals['steps'] . "\n";
                 echo "    distance: " . round((float)$totals['distance_meters']) . "\n";
+
+                if ($hasTreadmillType) {
+                    echo "    treadmill_duration_minutes: " . round((float)$totals['treadmill_duration_minutes'], 1) . "\n";
+                    echo "    treadmill_avg_speed_kmh: " . round((float)$totals['treadmill_avg_speed_kmh'], 2) . "\n";
+                }
             }
         }
     } else {
@@ -587,13 +629,48 @@ function getDatabaseConnection($config) {
 
     try {
         $dsn = "mysql:host={$host};port={$port};dbname={$database};charset=utf8mb4";
-        return new PDO($dsn, $username, $password, [
+        $pdo = new PDO($dsn, $username, $password, [
             PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
             PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
         ]);
+        ensureMeasurementsSchema($pdo);
+        return $pdo;
     } catch (Exception $e) {
         echo "Error: Failed to connect to database: " . $e->getMessage() . "\n";
         exit(1);
+    }
+}
+
+/**
+ * Ensure required treadmill columns exist on measurements table
+ */
+function ensureMeasurementsSchema($pdo) {
+    $requiredColumns = [
+        'treadmill_duration_minutes' => 'DECIMAL(8,2) NULL',
+        'treadmill_avg_speed_kmh' => 'DECIMAL(6,2) NULL',
+    ];
+
+    $stmt = $pdo->query("SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'measurements'");
+    $existingColumns = [];
+    foreach ($stmt->fetchAll() as $row) {
+        $existingColumns[$row['COLUMN_NAME']] = true;
+    }
+
+    foreach ($requiredColumns as $columnName => $columnDefinition) {
+        if (!isset($existingColumns[$columnName])) {
+            $pdo->exec("ALTER TABLE measurements ADD COLUMN `{$columnName}` {$columnDefinition}");
+        }
+    }
+
+    // Keep older installations working by migrating old columns when present.
+    if (isset($existingColumns['treadmill_duration_seconds']) && !isset($existingColumns['treadmill_duration_minutes'])) {
+        $pdo->exec("ALTER TABLE measurements ADD COLUMN `treadmill_duration_minutes` DECIMAL(8,2) NULL");
+        $pdo->exec("UPDATE measurements SET treadmill_duration_minutes = ROUND(treadmill_duration_seconds / 60, 2) WHERE treadmill_duration_seconds IS NOT NULL AND treadmill_duration_minutes IS NULL");
+        $existingColumns['treadmill_duration_minutes'] = true;
+    }
+
+    if ((isset($existingColumns['treadmill_duration_minutes']) || isset($existingColumns['treadmill_duration_seconds'])) && isset($existingColumns['treadmill'])) {
+        $pdo->exec("UPDATE measurements SET treadmill_avg_speed_kmh = ROUND((treadmill / 1000) / (treadmill_duration_minutes / 60), 2) WHERE treadmill_duration_minutes IS NOT NULL AND treadmill_duration_minutes > 0 AND treadmill_avg_speed_kmh IS NULL");
     }
 }
 
@@ -617,6 +694,8 @@ function buildMeasurementsFromAggregateData($data, $timezone, $fallbackDate = nu
                     'walking_meters' => 0.0,
                     'biking_meters' => 0.0,
                     'treadmill_meters' => 0.0,
+                    'treadmill_duration_minutes' => 0.0,
+                    'treadmill_avg_speed_kmh' => 0.0,
                 ];
             }
 
@@ -628,8 +707,15 @@ function buildMeasurementsFromAggregateData($data, $timezone, $fallbackDate = nu
                 $dailyTotals[$dateOnly]['walking_meters'] += (float)$bucketTotals['distance_meters'];
             } elseif ($activityLabel === 'Biking') {
                 $dailyTotals[$dateOnly]['biking_meters'] += (float)$bucketTotals['distance_meters'];
-            } elseif ($activityLabel === 'Treadmill') {
+            } elseif (isTreadmillActivityType($activityType)) {
                 $dailyTotals[$dateOnly]['treadmill_meters'] += (float)$bucketTotals['distance_meters'];
+                $dailyTotals[$dateOnly]['treadmill_duration_minutes'] += extractBucketDurationMinutes($bucket);
+                $durationMinutes = (float)$dailyTotals[$dateOnly]['treadmill_duration_minutes'];
+                if ($durationMinutes > 0) {
+                    $distanceKm = ((float)$dailyTotals[$dateOnly]['treadmill_meters']) / 1000;
+                    $durationHours = $durationMinutes / 60;
+                    $dailyTotals[$dateOnly]['treadmill_avg_speed_kmh'] = round($distanceKm / $durationHours, 2);
+                }
             }
         }
 
@@ -646,6 +732,8 @@ function buildMeasurementsFromAggregateData($data, $timezone, $fallbackDate = nu
                 'walking' => (int)round($totals['walking_meters']),
                 'biking' => (int)round($totals['biking_meters']),
                 'treadmill' => (int)round($totals['treadmill_meters']),
+                'treadmill_duration_minutes' => round((float)$totals['treadmill_duration_minutes'], 2),
+                'treadmill_avg_speed_kmh' => round((float)$totals['treadmill_avg_speed_kmh'], 2),
                 'steps' => (int)$totals['steps'],
             ];
         }
@@ -665,7 +753,7 @@ function insertMeasurements($config, $measurements) {
     try {
         $pdo = getDatabaseConnection($config);
 
-        $stmt = $pdo->prepare('INSERT INTO measurements (`date`, `meters`, `walking`, `biking`, `treadmill`, `steps`) VALUES (:date, :meters, :walking, :biking, :treadmill, :steps)');
+        $stmt = $pdo->prepare('INSERT INTO measurements (`date`, `meters`, `walking`, `biking`, `treadmill`, `treadmill_duration_minutes`, `treadmill_avg_speed_kmh`, `steps`) VALUES (:date, :meters, :walking, :biking, :treadmill, :treadmill_duration_minutes, :treadmill_avg_speed_kmh, :steps)');
 
         foreach ($measurements as $measurement) {
             $stmt->execute([
@@ -674,6 +762,8 @@ function insertMeasurements($config, $measurements) {
                 ':walking' => (int)($measurement['walking'] ?? 0),
                 ':biking' => (int)($measurement['biking'] ?? 0),
                 ':treadmill' => (int)($measurement['treadmill'] ?? 0),
+                ':treadmill_duration_minutes' => (float)($measurement['treadmill_duration_minutes'] ?? 0),
+                ':treadmill_avg_speed_kmh' => (float)($measurement['treadmill_avg_speed_kmh'] ?? 0),
                 ':steps' => (int)$measurement['steps'],
             ]);
         }
@@ -719,14 +809,6 @@ function fetchAggregatedFitnessData($config, $date = null) {
             ],
             [
                 'dataTypeName' => 'com.google.distance.delta',
-            ],
-            [
-                // Uncomment to include calories data
-                // 'dataTypeName' => 'com.google.calories.expended',
-            ],
-            [
-                // Uncomment to include heart rate data
-                // 'dataTypeName' => 'com.google.heart_rate.bpm',
             ],
         ],
         'bucketByActivityType' => [
@@ -800,7 +882,7 @@ function exportMeasurementsToCsv($config, $outputPath = null) {
 
     try {
         $pdo = getDatabaseConnection($config);
-        $stmt = $pdo->query('SELECT `date`, `steps`, `meters`, `walking`, `biking`, `treadmill` FROM measurements ORDER BY `date` ASC');
+        $stmt = $pdo->query('SELECT `date`, `steps`, `meters`, `walking`, `biking`, `treadmill`, `treadmill_duration_minutes`, `treadmill_avg_speed_kmh` FROM measurements ORDER BY `date` ASC');
         $rows = $stmt->fetchAll();
 
         $csvHandle = fopen($outputPath, 'w');
@@ -809,7 +891,7 @@ function exportMeasurementsToCsv($config, $outputPath = null) {
             exit(1);
         }
 
-        fputcsv($csvHandle, ['date', 'steps', 'kilometres', 'walking_kilometres', 'biking_kilometres', 'treadmill_kilometres'], ',', '"', '\\');
+        fputcsv($csvHandle, ['date', 'steps', 'kilometres', 'walking_kilometres', 'biking_kilometres', 'treadmill_kilometres', 'treadmill_minutes', 'treadmill_avg_speed_kmh'], ',', '"', '\\');
 
         $weekSteps = 0;
         $weekMeters = 0;
@@ -860,10 +942,13 @@ function exportMeasurementsToCsv($config, $outputPath = null) {
             $walkingMeters = (int)($row['walking'] ?? 0);
             $bikingMeters = (int)($row['biking'] ?? 0);
             $treadmillMeters = (int)($row['treadmill'] ?? 0);
+            $treadmillDurationMinutes = (float)($row['treadmill_duration_minutes'] ?? 0);
+            $treadmillAvgSpeedKmh = (float)($row['treadmill_avg_speed_kmh'] ?? 0);
             $kilometres = round($meters / 1000, 3);
             $walkingKilometres = round($walkingMeters / 1000, 3);
             $bikingKilometres = round($bikingMeters / 1000, 3);
             $treadmillKilometres = round($treadmillMeters / 1000, 3);
+            $treadmillMinutes = round($treadmillDurationMinutes, 2);
 
             if ($maxSteps === null || $steps > $maxSteps) {
                 $maxSteps = $steps;
@@ -908,6 +993,8 @@ function exportMeasurementsToCsv($config, $outputPath = null) {
                 $walkingKilometres,
                 $bikingKilometres,
                 $treadmillKilometres,
+                $treadmillMinutes,
+                round($treadmillAvgSpeedKmh, 2),
             ], ',', '"', '\\');
 
             $nextRow = ($i + 1 < $rowCount) ? $rows[$i + 1] : null;
@@ -1027,6 +1114,89 @@ function exportMeasurementsToCsv($config, $outputPath = null) {
         echo "Error exporting measurements to CSV: " . $e->getMessage() . "\n";
         exit(1);
     }
+}
+
+/**
+ * Extract bucket duration in minutes for DB storage
+ */
+function extractBucketDurationMinutes($bucket) {
+    return round(extractBucketDurationSeconds($bucket) / 60, 2);
+}
+
+/**
+ * Extract bucket duration in seconds from bucket time bounds
+ */
+function extractBucketDurationSeconds($bucket) {
+    $durationFromPoints = extractBucketDurationSecondsFromPoints($bucket);
+    if ($durationFromPoints > 0) {
+        return $durationFromPoints;
+    }
+
+    $startMsRaw = $bucket['startTimeMillis'] ?? null;
+    $endMsRaw = $bucket['endTimeMillis'] ?? null;
+
+    if (!is_numeric($startMsRaw) || !is_numeric($endMsRaw)) {
+        return 0;
+    }
+
+    $durationMs = (int)$endMsRaw - (int)$startMsRaw;
+    if ($durationMs <= 0) {
+        return 0;
+    }
+
+    return (int)floor($durationMs / 1000);
+}
+
+/**
+ * Extract duration in seconds by summing dataset point intervals
+ */
+function extractBucketDurationSecondsFromPoints($bucket) {
+    if (!isset($bucket['dataset']) || empty($bucket['dataset'])) {
+        return 0;
+    }
+
+    $prioritizedMatchers = [
+        'speed',
+        'distance',
+        'step_count',
+    ];
+
+    foreach ($prioritizedMatchers as $matcher) {
+        $durationSeconds = 0;
+
+        foreach ($bucket['dataset'] as $dataset) {
+            $dataSourceId = $dataset['dataSourceId'] ?? '';
+            if (strpos($dataSourceId, $matcher) === false) {
+                continue;
+            }
+
+            if (empty($dataset['point'])) {
+                continue;
+            }
+
+            foreach ($dataset['point'] as $point) {
+                $startNanosRaw = $point['startTimeNanos'] ?? null;
+                $endNanosRaw = $point['endTimeNanos'] ?? null;
+
+                if (!is_numeric($startNanosRaw) || !is_numeric($endNanosRaw)) {
+                    continue;
+                }
+
+                $durationNanos = ((float)$endNanosRaw - (float)$startNanosRaw);
+                if ($durationNanos <= 0) {
+                    continue;
+                }
+
+                $durationSeconds += (int)floor($durationNanos / 1000000000);
+            }
+        }
+
+        if ($durationSeconds > 0) {
+            return $durationSeconds;
+        }
+    }
+
+    return 0;
 }
 
 /**
